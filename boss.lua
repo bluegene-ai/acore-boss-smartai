@@ -697,6 +697,18 @@ local SKILL_PRESET_LIBRARY = {
 }
 
 local SKILL_POOLS = {}
+
+-- 专用打断法术池：优先尝试真正带打断效果的法术
+local INTERRUPT_SPELL_LIBRARY = {
+    {spellId = 57994, name = "风剪", maxRange = 25, cooldown = 8},
+    {spellId = 2139, name = "法术反制", maxRange = 30, cooldown = 10},
+    {spellId = 1766, name = "脚踢", maxRange = 8, cooldown = 10},
+    {spellId = 6552, name = "拳击", maxRange = 8, cooldown = 10},
+    {spellId = 47528, name = "心灵冰冻", maxRange = 8, cooldown = 8},
+    {spellId = 72, name = "盾击", maxRange = 8, cooldown = 12},
+    {spellId = 19647, name = "法术封锁", maxRange = 30, cooldown = 20},
+}
+
 local COMBO_CHAINS = {}
 local OPENING_SKILLS = {}
 local ACTIVE_SKILL_PRESET_KEY = nil
@@ -2205,17 +2217,6 @@ end
 
 -- ========== 技能决策系统 ==========
 local SkillAI = {}
-
--- 专用打断法术池：优先尝试真正带打断效果的法术，而不是普通伤害技能。
-local INTERRUPT_SPELL_LIBRARY = {
-    {spellId = 57994, name = "风剪", maxRange = 25, cooldown = 8},
-    {spellId = 2139, name = "法术反制", maxRange = 30, cooldown = 10},
-    {spellId = 1766, name = "脚踢", maxRange = 8, cooldown = 10},
-    {spellId = 6552, name = "拳击", maxRange = 8, cooldown = 10},
-    {spellId = 47528, name = "心灵冰冻", maxRange = 8, cooldown = 8},
-    {spellId = 72, name = "盾击", maxRange = 8, cooldown = 12},
-    {spellId = 19647, name = "法术封锁", maxRange = 30, cooldown = 20},
-}
 
 -- 检查技能条件
 function SkillAI:CheckCondition(condition, creature, target)
