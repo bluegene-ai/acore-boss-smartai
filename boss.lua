@@ -32,6 +32,7 @@ local BOSS_RUNTIME_KEY = "current"
 local BOSS_CONFIG_KEY = "current"
 local BOSS_DECIMAL_SCALE = 100
 local BOSS_SCHEMA_READY = false
+local BuildNearbyPlayerList
 
 local function BossNow()
     local success, gameTime = pcall(function() return GetGameTime() end)
@@ -272,6 +273,24 @@ local function BossSchemaColumnExists(tableName, columnName)
     return query ~= nil and query:GetUInt32(0) > 0
 end
 
+local function EnsureBossSchemaColumn(tableName, columnName, columnDefinition)
+    if BossSchemaColumnExists(tableName, columnName) then
+        return
+    end
+
+    CharDBExecute(
+        'ALTER TABLE `'
+            .. BOSS_DB_NAME
+            .. '`.`'
+            .. tableName
+            .. '` ADD COLUMN `'
+            .. columnName
+            .. '` '
+            .. columnDefinition
+            .. ';'
+    )
+end
+
 local function EnsureBossSchema(force)
     if BOSS_SCHEMA_READY and not force then
         return true
@@ -372,9 +391,20 @@ local function EnsureBossSchema(force)
         .. '`updated_at` INT NOT NULL DEFAULT 0,'
         .. 'PRIMARY KEY (`state_key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
 
-    if not BossSchemaColumnExists('boss_activity_config', 'spawn_points_text') then
-        CharDBExecute('ALTER TABLE `' .. BOSS_DB_NAME .. '`.`boss_activity_config` ADD COLUMN `spawn_points_text` TEXT NULL AFTER `reward_mounts_text`;')
-    end
+    EnsureBossSchemaColumn(
+        'boss_activity_config',
+        'spawn_points_text',
+        'TEXT NULL AFTER `reward_mounts_text`'
+    )
+
+    EnsureBossSchemaColumn('boss_activity_contributors', 'account_id', 'INT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn('boss_activity_contributors', 'healing_done', 'BIGINT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn('boss_activity_contributors', 'threat_samples', 'INT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn('boss_activity_contributors', 'presence_samples', 'INT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn('boss_activity_contributors', 'contribution_score', 'DOUBLE NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn('boss_activity_contributors', 'was_killer', 'TINYINT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn('boss_activity_contributors', 'rewarded_random', 'TINYINT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn('boss_activity_contributors', 'guaranteed_reward', 'TINYINT NOT NULL DEFAULT 0')
 
     BOSS_SCHEMA_READY = true
     return true
@@ -2176,6 +2206,17 @@ end
 -- ========== 技能决策系统 ==========
 local SkillAI = {}
 
+-- 专用打断法术池：优先尝试真正带打断效果的法术，而不是普通伤害技能。
+local INTERRUPT_SPELL_LIBRARY = {
+    {spellId = 57994, name = "风剪", maxRange = 25, cooldown = 8},
+    {spellId = 2139, name = "法术反制", maxRange = 30, cooldown = 10},
+    {spellId = 1766, name = "脚踢", maxRange = 8, cooldown = 10},
+    {spellId = 6552, name = "拳击", maxRange = 8, cooldown = 10},
+    {spellId = 47528, name = "心灵冰冻", maxRange = 8, cooldown = 8},
+    {spellId = 72, name = "盾击", maxRange = 8, cooldown = 12},
+    {spellId = 19647, name = "法术封锁", maxRange = 30, cooldown = 20},
+}
+
 -- 检查技能条件
 function SkillAI:CheckCondition(condition, creature, target)
     if condition == "none" then return true end
@@ -2321,43 +2362,27 @@ function SkillAI:TryInterruptCast(creature, target, state)
         return false
     end
     
-    -- 收集所有可用的打断技能
-    local interruptSkills = {}
-    
-    -- 从所有阶段中查找打断技能
-    for phase, skillPool in pairs(SKILL_POOLS) do
-        if skillPool then
-            for _, skill in ipairs(skillPool) do
-                -- 打断技能条件: casting_target 或 caster_target
-                if skill.condition == "casting_target" or skill.condition == "caster_target" then
-                    if self:CheckCondition(skill.condition, creature, target) then
-                        table.insert(interruptSkills, skill)
-                    end
+    for _, interruptSpell in ipairs(INTERRUPT_SPELL_LIBRARY) do
+        local distance = SafeGetDistance(creature, target)
+        if distance and distance <= interruptSpell.maxRange then
+            print(" [AI]打断施法! 对 " .. SafeGetUnitName(target) .. " 使用 " .. interruptSpell.name)
+            local castSuccess = pcall(function() creature:CastSpell(target, interruptSpell.spellId, true) end)
+            if castSuccess then
+                state.interruptCD = interruptSpell.cooldown
+
+                -- 施放后若目标已不在施法，则判定为有效打断。
+                if not TargetSelector:IsCasting(target) then
+                    return true
                 end
+
+                print(" [AI]" .. interruptSpell.name .. " 未打断成功，尝试下一个打断法术")
+            else
+                print(" [AI]打断技能施放失败: " .. interruptSpell.name .. " -> " .. SafeGetUnitName(target))
             end
         end
     end
-    
-    if #interruptSkills == 0 then
-        return false
-    end
-    
-    -- 按优先级排序，选择最高优先级的打断技能
-    table.sort(interruptSkills, function(a, b) return a.priority > b.priority end)
-    local skill = interruptSkills[1]
-    
-    -- 施放打断技能
-    print(" [AI]打断施法! 对 " .. SafeGetUnitName(target) .. " 使用 " .. skill.name)
-    local castSuccess = pcall(function() creature:CastSpell(target, skill.spellId, true) end)
-    if not castSuccess then
-        print(" [AI]打断技能施放失败: " .. skill.name .. " -> " .. SafeGetUnitName(target))
-        return false
-    end
-    
-    -- 设置打断冷却（使用技能的最小CD）
-    state.interruptCD = skill.minCD
-    
-    return true
+
+    return false
 end
 
 -- 施放技能的辅助函数，统一处理技能施放和喊话
@@ -2535,7 +2560,7 @@ local function RegisterBossPatrol(creature)
     end, BOSS_CONFIG.patrolInterval, 0)
 end
 
-local function BuildNearbyPlayerList(unit, maxDistance)
+BuildNearbyPlayerList = function(unit, maxDistance)
     if not IsUnitValid(unit) then return {} end
 
     local players = {}
