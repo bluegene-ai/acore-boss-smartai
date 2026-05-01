@@ -33,6 +33,9 @@ local BOSS_CONFIG_KEY = "current"
 local BOSS_DECIMAL_SCALE = 100
 local BOSS_SCHEMA_READY = false
 local BuildNearbyPlayerList
+local InsertBossEvent
+local SetActiveBoss
+local ClearActiveBoss
 
 local function BossNow()
     local success, gameTime = pcall(function() return GetGameTime() end)
@@ -1157,6 +1160,26 @@ local function GetQueryUInt(query, columnIndex, fallbackValue)
     return fallbackValue
 end
 
+local function GetQueryFloat(query, columnIndex, fallbackValue)
+    local success, value = pcall(function() return query:GetFloat(columnIndex) end)
+    if success and value ~= nil then
+        local numericValue = tonumber(value)
+        if numericValue ~= nil then
+            return numericValue
+        end
+    end
+
+    local stringSuccess, stringValue = pcall(function() return query:GetString(columnIndex) end)
+    if stringSuccess and stringValue ~= nil then
+        local numericValue = tonumber(stringValue)
+        if numericValue ~= nil then
+            return numericValue
+        end
+    end
+
+    return fallbackValue
+end
+
 local function BossSqlEscape(value)
     local text = tostring(value or "")
     text = text:gsub("\\", "\\\\")
@@ -1602,7 +1625,87 @@ local function PersistBossRuntime(source, overrides)
     CharDBExecute(sql)
 end
 
-local function InsertBossEvent(source, eventType, eventNote, actorName, actorGuid, payload)
+local function BossStatusIndicatesActive(status)
+    local normalizedStatus = tostring(status or "")
+    return normalizedStatus == "spawned" or normalizedStatus == "engaged"
+end
+
+local function TryGetCreatureByGUID(guid)
+    local numericGuid = tonumber(guid) or 0
+    if numericGuid <= 0 then
+        return nil
+    end
+
+    local success, creature = pcall(function() return GetCreatureByGUID(numericGuid) end)
+    if success and IsUnitValid(creature) and IsManagedBossEntry(creature:GetEntry()) then
+        return creature
+    end
+
+    return nil
+end
+
+local function LoadBossRuntimeFromDB()
+    EnsureBossSchema()
+
+    local query = CharDBQuery(string.format(
+        "SELECT `boss_guid`, `boss_entry`, `boss_name`, `map_id`, `instance_id`, `home_x`, `home_y`, `home_z`, `phase`, `status`, `respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at` FROM `%s`.`boss_activity_runtime` WHERE `state_key`='%s' LIMIT 1;",
+        BOSS_DB_NAME,
+        BOSS_RUNTIME_KEY
+    ))
+
+    if not query then
+        return false
+    end
+
+    local runtimeGuid = GetQueryUInt(query, 0, 0)
+    local runtimeEntry = GetQueryUInt(query, 1, 0)
+    local runtimeName = GetQueryString(query, 2, "")
+    local runtimeMapId = GetQueryUInt(query, 3, 0)
+    local runtimeInstanceId = GetQueryUInt(query, 4, 0)
+    local runtimeHomeX = GetQueryFloat(query, 5, 0)
+    local runtimeHomeY = GetQueryFloat(query, 6, 0)
+    local runtimeHomeZ = GetQueryFloat(query, 7, 0)
+    local runtimePhase = GetQueryUInt(query, 8, 0)
+    local runtimeStatus = GetQueryString(query, 9, "idle")
+    local runtimeRespawnAt = GetQueryUInt(query, 10, 0)
+    local runtimeLastSpawnAt = GetQueryUInt(query, 11, 0)
+    local runtimeLastEngageAt = GetQueryUInt(query, 12, 0)
+    local runtimeLastDeathAt = GetQueryUInt(query, 13, 0)
+    local runtimeLastResetAt = GetQueryUInt(query, 14, 0)
+
+    bossRuntimeState.phase = runtimePhase
+    bossRuntimeState.status = runtimeStatus
+    bossRuntimeState.respawnAt = runtimeRespawnAt
+    bossRuntimeState.lastSpawnAt = runtimeLastSpawnAt
+    bossRuntimeState.lastEngageAt = runtimeLastEngageAt
+    bossRuntimeState.lastDeathAt = runtimeLastDeathAt
+    bossRuntimeState.lastResetAt = runtimeLastResetAt
+
+    if runtimeGuid > 0 and runtimeEntry > 0 and BossStatusIndicatesActive(runtimeStatus) then
+        currentActiveBossGUID = runtimeGuid
+        activeBossCreature = nil
+        activeBossInfo = {
+            guid = runtimeGuid,
+            entry = runtimeEntry,
+            name = ResolveBossCandidateName(runtimeEntry, runtimeName),
+            x = runtimeHomeX,
+            y = runtimeHomeY,
+            z = runtimeHomeZ,
+            mapId = runtimeMapId,
+            instanceId = runtimeInstanceId,
+            homeX = runtimeHomeX,
+            homeY = runtimeHomeY,
+            homeZ = runtimeHomeZ,
+            homeO = 0,
+        }
+    else
+        ClearActiveBoss()
+    end
+
+    return true
+end
+
+    InsertBossEvent = function(source, eventType, eventNote, actorName, actorGuid, payload)
     EnsureBossSchema()
     local context = ResolveBossContext(source)
     local sql = string.format(
@@ -3044,15 +3147,63 @@ end
 
 -- ========== Boss管理函数 ==========
 local function HasActiveBoss()
-    if not currentActiveBossGUID then return false end
-    return scriptSpawnedBossGUIDs[currentActiveBossGUID] ~= nil
+    if currentActiveBossGUID and IsUnitValid(activeBossCreature) then
+        local activeEntry = tonumber(activeBossCreature:GetEntry() or 0) or 0
+        if IsManagedBossEntry(activeEntry) then
+            scriptSpawnedBossGUIDs[currentActiveBossGUID] = true
+            return true
+        end
+    end
+
+    local activeGuid = 0
+    if currentActiveBossGUID then
+        activeGuid = tonumber(currentActiveBossGUID) or 0
+    elseif activeBossInfo then
+        activeGuid = tonumber(activeBossInfo.guid or 0) or 0
+    end
+
+    if activeGuid > 0 and BossStatusIndicatesActive(bossRuntimeState.status) then
+        local recoveredBoss = TryGetCreatureByGUID(activeGuid)
+        if recoveredBoss then
+            SetActiveBoss(recoveredBoss)
+            scriptSpawnedBossGUIDs[activeGuid] = true
+            return true
+        end
+    end
+
+    if BossStatusIndicatesActive(bossRuntimeState.status) or activeGuid > 0 then
+        local staleGuid = activeGuid
+        ClearActiveBoss()
+        PersistBossRuntime(nil, {
+            boss_guid = 0,
+            boss_entry = 0,
+            boss_name = "",
+            map_id = 0,
+            instance_id = 0,
+            home_x = 0,
+            home_y = 0,
+            home_z = 0,
+            status = "idle",
+            phase = 0,
+            respawn_at = 0,
+            last_spawn_at = 0,
+            last_engage_at = 0,
+            last_death_at = 0,
+            last_reset_at = 0,
+        })
+        InsertBossEvent(nil, "runtime_cleared", "检测到僵尸 Boss 运行时记录，已自动清理。", "", 0, {
+            stale_guid = staleGuid,
+        })
+    end
+
+    return false
 end
 
 local function GetActiveBossInfo()
     return activeBossInfo
 end
 
-local function SetActiveBoss(creature)
+SetActiveBoss = function(creature)
     if creature then
         local guid = creature:GetGUIDLow()
         local entry = creature:GetEntry()
@@ -3080,7 +3231,7 @@ local function SetActiveBoss(creature)
     end
 end
 
-local function ClearActiveBoss()
+ClearActiveBoss = function()
     currentActiveBossGUID = nil
     activeBossCreature = nil
     activeBossInfo = nil
@@ -3912,10 +4063,12 @@ function RegisterBossEventsForCandidates()
     end
 end
 
-PersistBossRuntime(nil, {
-    status = bossRuntimeState.status,
-    phase = bossRuntimeState.phase,
-})
+if not LoadBossRuntimeFromDB() then
+    PersistBossRuntime(nil, {
+        status = bossRuntimeState.status,
+        phase = bossRuntimeState.phase,
+    })
+end
 
 -- ========== 注册事件 ==========
 RegisterBossEventsForCandidates()
