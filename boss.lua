@@ -3,10 +3,32 @@
 -- 特性：智能目标选择、技能连招、战术移动、环境感知、支持web管理
 -- 作者：pureland.fun
 local basePrint = print
-print(">>Script:BOSS SmartAI loading...OK")
 
 -- ========== 日志系统 ==========
-local logFile = io.open("lua_scripts/lua_logs/boss.log", "a")
+-- 用「文件级 local print」遮蔽全局 print，绝不改写 _G.print：
+-- 历史版本直接覆盖了全局 print，导致本文件之后加载的所有 Eluna 脚本
+-- 的调试输出都被写进 boss.log，控制台反而看不到。
+local BOSS_LOG_PATH = "lua_scripts/lua_logs/boss.log"
+local BOSS_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+local function RotateBossLog()
+    local probe = io.open(BOSS_LOG_PATH, "r")
+    if not probe then
+        return
+    end
+
+    local size = probe:seek("end") or 0
+    probe:close()
+    if size < BOSS_LOG_MAX_BYTES then
+        return
+    end
+
+    os.rename(BOSS_LOG_PATH, BOSS_LOG_PATH .. "." .. os.date("%Y%m%d-%H%M%S") .. ".bak")
+end
+
+RotateBossLog()
+local logFile = io.open(BOSS_LOG_PATH, "a")
+
 local function WriteLog(message)
     local timestamp = os.date("%Y-%m-%d %H:%M:%S")
     if logFile then
@@ -17,7 +39,7 @@ local function WriteLog(message)
     end
 end
 
-print = function(...)
+local function BossLog(...)
     local args = {...}
     local message = ""
     for i, v in ipairs(args) do
@@ -27,15 +49,28 @@ print = function(...)
     WriteLog(message)
 end
 
+-- 本文件内的 print 全部走日志，不再影响其他脚本
+local print = BossLog
+
+basePrint(">>Script:BOSS SmartAI loading...OK")
+
 local BOSS_DB_NAME = "ac_eluna"
 local BOSS_RUNTIME_KEY = "current"
 local BOSS_CONFIG_KEY = "current"
 local BOSS_DECIMAL_SCALE = 100
 local BOSS_SCHEMA_READY = false
+
+-- 【前置声明】以下名字在文件后段才赋值。Lua 只在「声明之后」的代码里把它们当 local，
+-- 放在前面使用的函数会解析成全局变量（运行期为 nil，静默失效）。
 local BuildNearbyPlayerList
 local InsertBossEvent
 local SetActiveBoss
 local ClearActiveBoss
+local IsManagedBossEntry
+local DEFAULT_SPAWN_POINTS
+local activeBossInfo
+local RegisterBossEventsForEntry
+local RegisterBossEventsForCandidates
 
 local function BossNow()
     local success, gameTime = pcall(function() return GetGameTime() end)
@@ -357,7 +392,7 @@ local function EnsureBossSchema(force)
         .. 'KEY `idx_player_guid` (`player_guid`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
     CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`boss_activity_config` ('
         .. '`state_key` VARCHAR(32) NOT NULL,'
-        .. '`boss_entry` INT NOT NULL DEFAULT 647,'
+        .. '`boss_entry` INT NOT NULL DEFAULT 190090,'
         .. '`boss_name` VARCHAR(120) NOT NULL DEFAULT "",'
         .. '`boss_level` INT NOT NULL DEFAULT 83,'
         .. '`boss_scale_scaled` INT NOT NULL DEFAULT 500,'
@@ -416,13 +451,19 @@ end
 EnsureBossSchema(true)
 
 -- ========== Boss相关配置 ==========
+-- 活动 Boss 模板（默认项；启动时会以 ac_eluna.boss_activity_config 中的配置覆盖）
 local BOSS_CANDIDATES = {
-    {entry = 647, name = "净土年兽"},
+    {entry = 190090, name = "送财童子"},
     --{entry = 507, name = "傻子2"},
     --{entry = 7342, name = "傻子3"},
 }
 
-local BOSS_ENTRY = 647
+-- 本模块自带的强度档位模板（AGMP 面板「难度档位」下拉框对应的 entry）：
+--   190090 入门 / 190091 标准 / 190092 困难 / 190093 团本
+-- 这些 entry 一律注册 creature 事件，保证面板切档后旧档位残留的 Boss 仍可被清理与结算。
+local BOSS_TIER_ENTRIES = {190090, 190091, 190092, 190093}
+
+local BOSS_ENTRY = 190090
 
 -- ========== 技能池预设（基于 Northrend 脚本） ==========
 -- 技能参数说明：
@@ -1032,7 +1073,7 @@ local function CloneSpawnPoints(points)
     return cloned
 end
 
-local DEFAULT_SPAWN_POINTS = CloneSpawnPoints(SPAWN_POINTS)
+DEFAULT_SPAWN_POINTS = CloneSpawnPoints(SPAWN_POINTS)
 
 -- ========== 援军配置 ==========
 -- HELPER_ENTRIES: Boss进入战斗时召唤的敌方援军（小怪）
@@ -1180,8 +1221,28 @@ local function GetQueryFloat(query, columnIndex, fallbackValue)
     return fallbackValue
 end
 
-local function BossSqlEscape(value)
-    local text = tostring(value or "")
+-- 按 UTF-8 边界截断，避免把多字节汉字切成半个字
+-- （MySQL 严格模式下，超长或被切断的字节会让整条 INSERT 失败并静默丢事件）
+local function TruncateUtf8(text, maxBytes)
+    local value = tostring(text or "")
+    if maxBytes == nil or maxBytes <= 0 or #value <= maxBytes then
+        return value
+    end
+
+    local cut = maxBytes
+    while cut > 0 do
+        local nextByte = string.byte(value, cut + 1)
+        if nextByte == nil or nextByte < 128 or nextByte >= 192 then
+            break
+        end
+        cut = cut - 1
+    end
+
+    return string.sub(value, 1, cut)
+end
+
+local function BossSqlEscape(value, maxBytes)
+    local text = TruncateUtf8(value, maxBytes)
     text = text:gsub("\\", "\\\\")
     text = text:gsub("'", "\\'")
     text = text:gsub("\r", "\\r")
@@ -1208,7 +1269,7 @@ local function PersistBossConfigToDB(insertIgnore)
         BOSS_DB_NAME,
         BOSS_CONFIG_KEY,
         ClampInteger(bossCandidate.entry or 647, 1, 2000000),
-        BossSqlEscape(ResolveBossCandidateName(bossCandidate.entry, bossCandidate.name)),
+        BossSqlEscape(ResolveBossCandidateName(bossCandidate.entry, bossCandidate.name), 120),
         ClampInteger(BOSS_CONFIG.bossLevel, 1, 255),
         ClampInteger(RoundToScaledInteger(BOSS_CONFIG.bossScale), 10, 5000),
         ClampInteger(RoundToScaledInteger(BOSS_CONFIG.bossHealthMultiplier), 10, 200000),
@@ -1218,8 +1279,8 @@ local function PersistBossConfigToDB(insertIgnore)
         ClampInteger(BOSS_CONFIG.respawnTimeMinutes, 1, 1440),
         ClampInteger(BOSS_CONFIG.minionCountMin, 0, 20),
         ClampInteger(BOSS_CONFIG.minionCountMax, 0, 20),
-        BossSqlEscape(ACTIVE_SKILL_PRESET_KEY or BOSS_CONFIG.skillPreset or SKILL_PRESET_ORDER[1]),
-        BossSqlEscape(ACTIVE_SKILL_DIFFICULTY_KEY or BOSS_CONFIG.skillDifficulty or SKILL_DIFFICULTY_ORDER[2]),
+        BossSqlEscape(ACTIVE_SKILL_PRESET_KEY or BOSS_CONFIG.skillPreset or SKILL_PRESET_ORDER[1], 64),
+        BossSqlEscape(ACTIVE_SKILL_DIFFICULTY_KEY or BOSS_CONFIG.skillDifficulty or SKILL_DIFFICULTY_ORDER[2], 64),
         REWARD_PROBABILITIES.guaranteedRewardEnabled and 1 or 0,
         REWARD_PROBABILITIES.guaranteedRewardNotify and 1 or 0,
         ClampInteger(REWARD_PROBABILITIES.maxRandomRewardPlayers, 0, 100),
@@ -1370,7 +1431,7 @@ local bossAIStates = {}
 local bossTraitsApplied = {}
 local bossBaseMaxHealth = {}
 local currentActiveBossGUID = nil
-local activeBossInfo = nil
+activeBossInfo = nil
 local activeBossCreature = nil
 local respawnTimerEventId = nil
 local bossRewardedGUIDs = {}
@@ -1604,16 +1665,16 @@ local function PersistBossRuntime(source, overrides)
         BOSS_RUNTIME_KEY,
         tonumber(bossGuid or 0) or 0,
         tonumber(bossEntry or 0) or 0,
-        BossSqlEscape(bossName or ""),
+        BossSqlEscape(bossName or "", 120),
         tonumber(mapId or 0) or 0,
         tonumber(instanceId or 0) or 0,
         tonumber(homeX or 0) or 0,
         tonumber(homeY or 0) or 0,
         tonumber(homeZ or 0) or 0,
         tonumber(bossRuntimeState.phase or 0) or 0,
-        BossSqlEscape(bossRuntimeState.status or "idle"),
-        BossSqlEscape(skillPreset or ""),
-        BossSqlEscape(skillDifficulty or ""),
+        BossSqlEscape(bossRuntimeState.status or "idle", 32),
+        BossSqlEscape(skillPreset or "", 64),
+        BossSqlEscape(skillDifficulty or "", 64),
         tonumber(bossRuntimeState.respawnAt or 0) or 0,
         tonumber(bossRuntimeState.lastSpawnAt or 0) or 0,
         tonumber(bossRuntimeState.lastEngageAt or 0) or 0,
@@ -1630,13 +1691,27 @@ local function BossStatusIndicatesActive(status)
     return normalizedStatus == "spawned" or normalizedStatus == "engaged"
 end
 
-local function TryGetCreatureByGUID(guid)
+-- mod-ale（Eluna）**没有** GetCreatureByGUID 这个全局函数：
+-- 正确做法是用 GetUnitGUID(lowguid, entry) 拼出完整 ObjectGuid，
+-- 再从地图取回对象（Map:GetWorldObject 内部走 Map::GetCreature，_objectsStore 里含召唤物）。
+local function TryGetCreatureByGUID(guid, entry, mapId, instanceId)
     local numericGuid = tonumber(guid) or 0
-    if numericGuid <= 0 then
+    local numericEntry = tonumber(entry) or 0
+    local numericMapId = tonumber(mapId) or 0
+    local numericInstanceId = tonumber(instanceId) or 0
+    if numericGuid <= 0 or numericEntry <= 0 or numericMapId <= 0 then
         return nil
     end
 
-    local success, creature = pcall(function() return GetCreatureByGUID(numericGuid) end)
+    local success, creature = pcall(function()
+        local map = GetMapById(numericMapId, numericInstanceId)
+        if not map then
+            return nil
+        end
+
+        return map:GetWorldObject(GetUnitGUID(numericGuid, numericEntry))
+    end)
+
     if success and IsUnitValid(creature) and IsManagedBossEntry(creature:GetEntry()) then
         return creature
     end
@@ -1715,10 +1790,10 @@ end
         BOSS_DB_NAME,
         tonumber(context.bossGuid or 0) or 0,
         tonumber(context.bossEntry or 0) or 0,
-        BossSqlEscape(context.bossName or ""),
-        BossSqlEscape(eventType or ""),
-        BossSqlEscape(eventNote or ""),
-        BossSqlEscape(actorName or ""),
+        BossSqlEscape(context.bossName or "", 120),
+        BossSqlEscape(eventType or "", 32),
+        BossSqlEscape(eventNote or "", 255),
+        BossSqlEscape(actorName or "", 120),
         tonumber(actorGuid or 0) or 0,
         BossSqlEscape(BossJsonEncode(payload or {})),
         BossNow()
@@ -1763,12 +1838,22 @@ local function BuildSafeThreatList(unit, cachedThreatList)
     return threatList
 end
 
-local function IsManagedBossEntry(entry)
+-- 受管 entry：当前配置的候选 + 本模块全部强度档位模板
+-- （档位由面板切换，旧档位残留的 Boss 仍需被识别、清理与结算）
+IsManagedBossEntry = function(entry)
+    local numericEntry = tonumber(entry) or 0
     for _, bossCandidate in ipairs(BOSS_CANDIDATES) do
-        if bossCandidate.entry == entry then
+        if tonumber(bossCandidate.entry or 0) == numericEntry then
             return true
         end
     end
+
+    for _, tierEntry in ipairs(BOSS_TIER_ENTRIES) do
+        if tierEntry == numericEntry then
+            return true
+        end
+    end
+
     return false
 end
 
@@ -1992,9 +2077,9 @@ local function InsertBossContributorSnapshot(source, record, score, rewardedRand
         BOSS_DB_NAME,
         tonumber(context.bossGuid or 0) or 0,
         tonumber(context.bossEntry or 0) or 0,
-        BossSqlEscape(context.bossName or ""),
+        BossSqlEscape(context.bossName or "", 120),
         tonumber(record.guidLow or 0) or 0,
-        BossSqlEscape(record.name or ""),
+        BossSqlEscape(record.name or "", 120),
         tonumber(record.accountId or 0) or 0,
         tonumber(record.damageDone or 0) or 0,
         tonumber(record.healingDone or 0) or 0,
@@ -3163,7 +3248,10 @@ local function HasActiveBoss()
     end
 
     if activeGuid > 0 and BossStatusIndicatesActive(bossRuntimeState.status) then
-        local recoveredBoss = TryGetCreatureByGUID(activeGuid)
+        local recoverEntry = activeBossInfo and tonumber(activeBossInfo.entry or 0) or 0
+        local recoverMapId = activeBossInfo and tonumber(activeBossInfo.mapId or 0) or 0
+        local recoverInstanceId = activeBossInfo and tonumber(activeBossInfo.instanceId or 0) or 0
+        local recoveredBoss = TryGetCreatureByGUID(activeGuid, recoverEntry, recoverMapId, recoverInstanceId)
         if recoveredBoss then
             SetActiveBoss(recoveredBoss)
             scriptSpawnedBossGUIDs[activeGuid] = true
@@ -3237,6 +3325,40 @@ ClearActiveBoss = function()
     activeBossInfo = nil
 end
 
+-- 记录每个Boss当前挂上的光环，用于配置热加载时做差量移除
+local bossAppliedAuras = {}
+
+local function CreatureIsInCombat(creature)
+    if not IsUnitValid(creature) then
+        return false
+    end
+
+    local success, inCombat = pcall(function() return creature:IsInCombat() end)
+    return success and inCombat == true
+end
+
+-- 从「模板」重算基准血量。
+-- 关键点：Unit:SetLevel 只写 UNIT_FIELD_LEVEL、不重算生物属性，历史版本拿
+-- creature:GetMaxHealth() 当基准，导致每次 reload/rebase 都把血量再乘一次倍率（指数放大）。
+-- 这里改用 Creature:UpdateEntry 让核心按模板重算属性；但它内部会 Initialize 威胁表，
+-- 所以战斗中绝不调用，改为按当前倍率反推，保证血量不会被重复放大。
+local function ResolveBossBaseMaxHealth(creature, guid)
+    if not CreatureIsInCombat(creature) then
+        local rebuilt = pcall(function() creature:UpdateEntry(creature:GetEntry()) end)
+        if rebuilt then
+            return creature:GetMaxHealth(), true
+        end
+    end
+
+    local multiplier = tonumber(BOSS_CONFIG.bossHealthMultiplier) or 1
+    if multiplier <= 0 then
+        multiplier = 1
+    end
+
+    print(" [配置]Boss无法按模板重算属性（战斗中或调用失败），基准血量按当前上限反推，GUID: " .. tostring(guid))
+    return math.max(1, math.floor(creature:GetMaxHealth() / multiplier + 0.5)), false
+end
+
 -- 为Boss应用特性
 local function ApplyBossTraits(creature, opts)
     if not creature then return end
@@ -3250,6 +3372,12 @@ local function ApplyBossTraits(creature, opts)
     local spawnZ = opts.homeZ or creature:GetZ()
     local spawnO = opts.homeO or creature:GetO()
 
+    -- 1) 需要重基准时先从模板取基准血量（会顺带把等级恢复为模板等级）
+    if not bossBaseMaxHealth[guid] or opts.forceRebase then
+        bossBaseMaxHealth[guid] = (ResolveBossBaseMaxHealth(creature, guid))
+    end
+
+    -- 2) 再套用本模块的等级 / 体型 / 归位点设置
     creature:SetLevel(BOSS_CONFIG.bossLevel)
     creature:SetScale(BOSS_CONFIG.bossScale)
 
@@ -3262,28 +3390,42 @@ local function ApplyBossTraits(creature, opts)
         activeBossInfo.homeO = spawnO
     end
 
-    -- 记录原始生命值上限，确保脱战重置后仍可按倍率恢复
-    if not bossBaseMaxHealth[guid] or opts.forceRebase then
-        bossBaseMaxHealth[guid] = creature:GetMaxHealth()
-    end
-
-    local targetMaxHealth = bossBaseMaxHealth[guid] * BOSS_CONFIG.bossHealthMultiplier
+    -- 3) 血量 = 模板基准 × 倍率（同一 guid 只会以模板为基准计算一次）
+    local targetMaxHealth = math.max(1, math.floor(bossBaseMaxHealth[guid] * BOSS_CONFIG.bossHealthMultiplier + 0.5))
     if creature:GetMaxHealth() ~= targetMaxHealth then
         creature:SetMaxHealth(targetMaxHealth)
     end
-    creature:SetHealth(creature:GetMaxHealth())
-    
+
+    -- 只在首次生成、或显式要求时回满血：战斗中保存面板配置不再顺带把 Boss 治满
+    if firstApply or opts.heal == true then
+        creature:SetHealth(creature:GetMaxHealth())
+    elseif creature:GetHealth() > creature:GetMaxHealth() then
+        creature:SetHealth(creature:GetMaxHealth())
+    end
+
+    -- 4) 光环差量：配置里删掉的光环必须真正移除，否则「热加载完全生效」是假的
+    local previousAuras = bossAppliedAuras[guid] or {}
+    local currentAuras = {}
     for _, auraId in ipairs(BOSS_CONFIG.bossAuras) do
+        currentAuras[auraId] = true
         creature:AddAura(auraId, creature)
     end
-    
+
+    for auraId in pairs(previousAuras) do
+        if not currentAuras[auraId] then
+            pcall(function() creature:RemoveAura(auraId) end)
+            print(" [配置]已移除Boss光环: " .. tostring(auraId))
+        end
+    end
+    bossAppliedAuras[guid] = currentAuras
+
     if firstApply then
         local yellText = string.gsub(BOSS_CONFIG.bossSpawnYell, "{BOSS_NAME}", bossName)
         creature:SendUnitYell(yellText, 0)
     end
-    
+
     bossTraitsApplied[guid] = true
-    
+
     -- 仅首次生成时注册循环，避免脱战重进重复注册
     if firstApply and opts.registerAI ~= false then
         creature:RegisterEvent(SmartBossAI, BOSS_CONFIG.aiUpdateInterval, 0)
@@ -3299,6 +3441,11 @@ local function SpawnRandomBoss(instanceId)
     -- 检查BOSS_CANDIDATES是否为空
     if not BOSS_CANDIDATES or #BOSS_CANDIDATES == 0 then
         print(" [错误] BOSS_CANDIDATES数组为空，无法生成Boss")
+        return nil
+    end
+
+    if not SPAWN_POINTS or #SPAWN_POINTS == 0 then
+        print(" [错误] SPAWN_POINTS数组为空，无法生成Boss（检查 boss_activity_config.spawn_points_text）")
         return nil
     end
 
@@ -3382,13 +3529,9 @@ local function OnBossEnterCombat(event, creature, target)
     
     bossAllySpawned[guid] = true
     print(" [调试信息]初始化智能AI战斗状态")
-    bossContributionStats[guid] = {
-        players = {},
-        totalDamage = 0,
-        totalHealing = 0,
-        totalThreatSamples = 0,
-        totalPresenceSamples = 0,
-    }
+    -- 只在本次生成的首次进战建立贡献表；脱战不再清空，
+    -- 否则「打一段 → 被拉开/脱战 → 再进战 → 击杀」时前半段贡献不会进入快照与奖励结算。
+    EnsureContributionState(guid)
 
     -- 确保脱战后重新进入能重新注册AI循环
     creature:RemoveEvents()
@@ -3738,6 +3881,8 @@ local function OnBossDied(event, creature, killer)
     bossAllySpawned[guid] = nil
     bossTraitsApplied[guid] = nil
     bossBaseMaxHealth[guid] = nil
+    bossAppliedAuras[guid] = nil
+    bossRewardedGUIDs[guid] = nil
     if currentActiveBossGUID == guid then ClearActiveBoss() end
     scriptSpawnedBossGUIDs[guid] = nil
     bossThreatSnapshots[guid] = nil
@@ -3752,7 +3897,8 @@ local function OnBossLeaveCombat(event, creature)
     bossAIStates[guid] = nil
     bossAllySpawned[guid] = nil
     bossThreatSnapshots[guid] = nil
-    bossContributionStats[guid] = nil
+    -- 注意：不清理 bossContributionStats[guid]，贡献要跨「脱战 → 再进战」累积，
+    -- 直到击杀结算（OnBossDied）或 GM 清理（.boss clear）时才释放。
     if scriptSpawnedBossGUIDs[guid] then
         local resetTime = BossNow()
         PersistBossRuntime(creature, {
@@ -3837,7 +3983,9 @@ local function OnBossCommand(event, player, command, chatHandler)
     local action = parts[2]
 
     if action == "help" then
-        BossSendMessage(player, chatHandler, "Boss命令用法：")
+        -- 首行走 BossReply：控制台/SOAP 调用必须带回 [AGMP_OK] 标记，
+        -- 否则面板的严格标记校验会把这几个「纯信息」子命令判成失败。
+        BossReply(player, chatHandler, true, "Boss命令用法：")
         BossSendMessage(player, chatHandler, "1. .boss 或 .boss spawn 生成当前配置的Boss。")
         BossSendMessage(player, chatHandler, "2. .boss help 查看这份命令说明。")
         BossSendMessage(player, chatHandler, "3. .boss config reload 从 ac_eluna 重新载入活动 Boss 配置。")
@@ -3845,7 +3993,11 @@ local function OnBossCommand(event, player, command, chatHandler)
         BossSendMessage(player, chatHandler, "5. .boss preset <key> 切换技能池预设。")
         BossSendMessage(player, chatHandler, "6. .boss difficulty list 查看所有技能强度档位。")
         BossSendMessage(player, chatHandler, "7. .boss difficulty <key> 切换技能强度档位。")
-        BossSendMessage(player, chatHandler, "8. .boss rebase 重新以当前模板数值为基准刷新Boss生命倍率。")
+        BossSendMessage(player, chatHandler, "8. .boss rebase 按模板重算基准血量再套用倍率（需脱战）。")
+        BossSendMessage(player, chatHandler, "9. .boss kill 击杀当前活跃Boss（走正常死亡与奖励流程）。")
+        BossSendMessage(player, chatHandler, "10. .boss clear 直接移除当前活跃Boss并复位运行时记录（不发奖励）。")
+        BossSendMessage(player, chatHandler, "当前Boss: " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].name or "")
+            .. " (Entry " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].entry or 0) .. ")")
         BossSendMessage(player, chatHandler, "当前技能池: " .. GetCurrentSkillPresetLabel())
         BossSendMessage(player, chatHandler, "当前强度: " .. GetCurrentSkillDifficultyLabel())
         return false
@@ -3864,8 +4016,12 @@ local function OnBossCommand(event, player, command, chatHandler)
 
         RegisterBossEventsForCandidates()
 
+        local previousEntry = activeBossInfo and tonumber(activeBossInfo.entry or 0) or 0
         if IsUnitValid(activeBossCreature) and IsManagedBossEntry(activeBossCreature:GetEntry()) then
-            ApplyBossTraits(activeBossCreature, {forceRebase = true, registerAI = false})
+            -- 热加载只刷新技能池/光环等运行配置：
+            -- 不在此处重算血量（重算需要 UpdateEntry，会清空威胁表，而且以当前上限为基准会造成倍率叠加）。
+            -- 血量与强度档位（entry 对应的模板）在下次生成时生效。
+            ApplyBossTraits(activeBossCreature, {registerAI = false})
         end
 
         PersistBossRuntime(activeBossCreature, {})
@@ -3877,6 +4033,13 @@ local function OnBossCommand(event, player, command, chatHandler)
         })
 
         BossReply(player, chatHandler, true, "Boss 配置已从 ac_eluna 热加载。")
+        local configuredEntry = BOSS_CANDIDATES[1] and tonumber(BOSS_CANDIDATES[1].entry or 0) or 0
+        if configuredEntry > 0 and previousEntry > 0 and configuredEntry ~= previousEntry then
+            BossSendMessage(player, chatHandler, string.format(
+                "提示：强度档位已从 entry %d 切换为 %d，当前活跃 Boss 仍使用旧模板，重生/重新生成后生效。",
+                previousEntry, configuredEntry))
+        end
+
         if player ~= nil and BOSS_CANDIDATES[1] then
             BossSendMessage(player, chatHandler, "当前 Boss: " .. ResolveBossCandidateName(BOSS_CANDIDATES[1].entry, BOSS_CANDIDATES[1].name) .. " (Entry " .. tostring(BOSS_CANDIDATES[1].entry) .. ")")
             BossSendMessage(player, chatHandler, "当前技能池: " .. GetCurrentSkillPresetLabel())
@@ -3887,7 +4050,7 @@ local function OnBossCommand(event, player, command, chatHandler)
 
     if action == "preset" then
         if not parts[3] or parts[3] == "list" then
-            BossSendMessage(player, chatHandler, "当前技能池预设: " .. GetCurrentSkillPresetLabel())
+            BossReply(player, chatHandler, true, "当前技能池预设: " .. GetCurrentSkillPresetLabel())
             BossSendMessage(player, chatHandler, "可选预设: " .. GetSkillPresetChoices())
             return false
         end
@@ -3914,7 +4077,7 @@ local function OnBossCommand(event, player, command, chatHandler)
 
     if action == "difficulty" then
         if not parts[3] or parts[3] == "list" then
-            BossSendMessage(player, chatHandler, "当前技能强度: " .. GetCurrentSkillDifficultyLabel())
+            BossReply(player, chatHandler, true, "当前技能强度: " .. GetCurrentSkillDifficultyLabel())
             BossSendMessage(player, chatHandler, "可选强度: " .. GetSkillDifficultyChoices())
             return false
         end
@@ -3956,17 +4119,117 @@ local function OnBossCommand(event, player, command, chatHandler)
             return false
         end
 
-        ApplyBossTraits(target, {forceRebase = true, registerAI = false})
+        -- 重基准走 Creature:UpdateEntry：核心会 Initialize 威胁表，
+        -- 战斗中执行等于把 Boss 打进脱战重置，因此战斗中直接拒绝。
+        if CreatureIsInCombat(target) then
+            BossReply(player, chatHandler, false, "Boss 正在战斗中，重基准会清空仇恨并重置战斗。请脱战后执行，或等它重生。")
+            return false
+        end
+
+        ApplyBossTraits(target, {forceRebase = true, registerAI = false, heal = true})
         PersistBossRuntime(target, {})
-        InsertBossEvent(target, "command_rebase", "已执行 Boss 重基准。", actorName, actorGuid, {
+        local resolvedGuid = SafeGetGuidLow(target)
+        local resolvedBase = tonumber(bossBaseMaxHealth[resolvedGuid] or 0) or 0
+        InsertBossEvent(target, "command_rebase", "已按模板重算 Boss 基准血量。", actorName, actorGuid, {
             health_multiplier = BOSS_CONFIG.bossHealthMultiplier,
+            base_max_health = resolvedBase,
         })
-        BossReply(player, chatHandler, true, "已重新基准血量并应用倍率。")
+        BossReply(player, chatHandler, true, string.format(
+            "已按模板重算基准血量：基准=%d × 倍率=%s → 上限=%d。",
+            resolvedBase,
+            tostring(BOSS_CONFIG.bossHealthMultiplier),
+            tonumber(target:GetMaxHealth() or 0) or 0))
+        return false
+    end
+
+    if action == "kill" then
+        -- 击杀当前活跃 Boss：走正常死亡流程（贡献结算、奖励发放、重生排程）
+        local target = nil
+        if IsUnitValid(activeBossCreature) and IsManagedBossEntry(activeBossCreature:GetEntry()) then
+            target = activeBossCreature
+        elseif activeBossInfo then
+            target = TryGetCreatureByGUID(activeBossInfo.guid, activeBossInfo.entry, activeBossInfo.mapId, activeBossInfo.instanceId)
+        end
+
+        if not IsUnitValid(target) then
+            BossReply(player, chatHandler, false, "当前没有可击杀的活跃 Boss。")
+            return false
+        end
+
+        -- Unit:Kill 的参数是「被杀者」，调用者才是 killer，所以这里必须让 killer 去 Kill(target)
+        local killerUnit = IsUnitValid(player) and player or target
+        local killSuccess = pcall(function() killerUnit:Kill(target) end)
+        if not killSuccess then
+            BossReply(player, chatHandler, false, "击杀 Boss 失败（Kill 调用异常）。")
+            return false
+        end
+
+        BossReply(player, chatHandler, true, "已击杀活跃 Boss（走正常死亡与奖励流程）。")
+        return false
+    end
+
+    if action == "clear" or action == "despawn" then
+        -- 清理活跃 Boss：直接移除、不发奖励、复位运行时记录（面板「重置」按钮）
+        local target = nil
+        if IsUnitValid(activeBossCreature) and IsManagedBossEntry(activeBossCreature:GetEntry()) then
+            target = activeBossCreature
+        elseif activeBossInfo then
+            target = TryGetCreatureByGUID(activeBossInfo.guid, activeBossInfo.entry, activeBossInfo.mapId, activeBossInfo.instanceId)
+        end
+
+        local clearedGuid = activeBossInfo and tonumber(activeBossInfo.guid or 0) or 0
+        local despawned = IsUnitValid(target)
+
+        -- 先写事件（此时 activeBossInfo 还在，事件里能记下被清理的是哪个 Boss），再清理内存状态
+        InsertBossEvent(nil, "command_clear", "GM 已清理活跃 Boss 并复位运行时记录。", actorName, actorGuid, {
+            cleared_guid = clearedGuid,
+            despawned = despawned and 1 or 0,
+        })
+
+        CancelRespawnTimer()
+
+        if despawned then
+            if target.RemoveEvents then
+                target:RemoveEvents()
+            end
+            pcall(function() target:DespawnOrUnsummon(0) end)
+        end
+
+        bossAIStates[clearedGuid] = nil
+        bossAllySpawned[clearedGuid] = nil
+        bossTraitsApplied[clearedGuid] = nil
+        bossBaseMaxHealth[clearedGuid] = nil
+        bossAppliedAuras[clearedGuid] = nil
+        bossRewardedGUIDs[clearedGuid] = nil
+        bossThreatSnapshots[clearedGuid] = nil
+        bossContributionStats[clearedGuid] = nil
+        scriptSpawnedBossGUIDs[clearedGuid] = nil
+
+        ClearActiveBoss()
+        PersistBossRuntime(nil, {
+            boss_guid = 0,
+            boss_entry = 0,
+            boss_name = "",
+            map_id = 0,
+            instance_id = 0,
+            home_x = 0,
+            home_y = 0,
+            home_z = 0,
+            status = "idle",
+            phase = 0,
+            respawn_at = 0,
+            last_reset_at = BossNow(),
+        })
+
+        BossReply(player, chatHandler, true, string.format(
+            "已清理活跃 Boss（GUID %d，%s）并复位运行时记录。",
+            clearedGuid,
+            despawned and "已从世界移除" or "世界中已不存在"))
         return false
     end
 
     if action ~= nil and action ~= "" and action ~= "spawn" then
-        BossReply(player, chatHandler, false, "未知的 .boss 子命令。")
+        BossReply(player, chatHandler, false, "未知的 .boss 子命令（可用: spawn / help / config reload / preset / difficulty / rebase / kill / clear）。")
         return false
     end
 
@@ -4041,7 +4304,7 @@ end
 
 local registeredBossEntries = {}
 
-function RegisterBossEventsForEntry(entry)
+RegisterBossEventsForEntry = function(entry)
     local numericEntry = tonumber(entry) or 0
     if numericEntry <= 0 or registeredBossEntries[numericEntry] then
         return
@@ -4057,9 +4320,15 @@ function RegisterBossEventsForEntry(entry)
     registeredBossEntries[numericEntry] = true
 end
 
-function RegisterBossEventsForCandidates()
+-- 候选 entry + 全部强度档位模板都挂事件：
+-- 面板切档后，旧档位残留的 Boss 依旧受管（可清理、可结算），无需重启服务器。
+RegisterBossEventsForCandidates = function()
     for _, bossCandidate in ipairs(BOSS_CANDIDATES) do
         RegisterBossEventsForEntry(bossCandidate.entry)
+    end
+
+    for _, tierEntry in ipairs(BOSS_TIER_ENTRIES) do
+        RegisterBossEventsForEntry(tierEntry)
     end
 end
 
