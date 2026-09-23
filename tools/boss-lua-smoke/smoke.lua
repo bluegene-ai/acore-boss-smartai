@@ -10,15 +10,16 @@
 --  这样脚本打不开日志文件、所有输出都回到 stdout）：
 --      lua.exe smoke.lua "E:\Server\release\80\lua_scripts\boss.lua"
 --
---  覆盖：配置加载(SQL 构造)、运行时持久化、help/config/preset/difficulty/
---        rebase/kill/clear/spawn/未知子命令、非 boss 命令放行、
---        以及「全局 print 未被覆盖」「不再泄漏全局函数」两项回归断言。
+--  覆盖：配置加载(SQL 构造/两张配置表)、扩展表建表与写入列一致、
+--        「数据库值覆盖脚本默认值」、运行时持久化、
+--        help/config/config show/preset/difficulty/rebase/kill/clear/spawn/未知子命令、
+--        非 boss 命令放行，以及「全局 print 未被覆盖」「不再泄漏全局函数」两项回归断言。
 -- ============================================================================
 
 local bossPath = arg and arg[1] or "E:/Server/release/80/lua_scripts/boss.lua"
 
 -- ---------------------------------------------------------------- 记录与断言
-local recorded = { sql = {}, events = {}, replies = {}, failures = {} }
+local recorded = { sql = {}, events = {}, replies = {}, failures = {}, alters = {} }
 local function fail(msg)
     table.insert(recorded.failures, msg)
     io.write("  [FAIL] " .. msg .. "\n")
@@ -43,29 +44,137 @@ local function mockQuery(values)
     }
 end
 
--- 线上真实配置的快照（boss_activity_config 的 34 列）
-local CONFIG_ROW = {
-    190090, "送财童子", 83, 999, 150000, "467", 50, 999, 10, 1, 2,
-    "spellbreak_bulwark", "hard", 1, 1, 3, 60, 10, 15, "weighted", 80,
-    100, 80, 35, 10, 3, 40753, 2, 30000, 50000,
-    "38082,41600,51809,34067", "45059,44491", "32768,30480", "571,4353.573,-4411.8877,151.3909",
+-- 数据库快照（按列名给出，不依赖描述表顺序）：
+--   main = ac_eluna.boss_activity_config（与 AGMP 面板共享）
+--   ext  = ac_eluna.boss_activity_config_ext（脚本私有配置）
+-- ext 故意用与文件内默认值不同的值：用来断言「运行时确实以数据库为准」。
+local CONFIG_VALUES = {
+    boss_entry = 190090, boss_name = "送财童子", boss_level = 83,
+    boss_scale_scaled = 999, boss_health_multiplier_scaled = 150000, boss_auras_text = "467",
+    ally_level = 50, ally_health_multiplier_scaled = 999, respawn_time_minutes = 10,
+    minion_count_min = 1, minion_count_max = 2,
+    skill_preset = "spellbreak_bulwark", skill_difficulty = "hard",
+    guaranteed_reward_enabled = 1, guaranteed_reward_notify = 1, max_random_reward_players = 3,
+    class_reward_chance = 60, formula_reward_chance = 10, mount_reward_chance = 15,
+    random_reward_mode = "weighted", participation_range = 80,
+    damage_weight = 100, healing_weight = 80, threat_weight = 35, presence_weight = 10, kill_weight = 3,
+    guaranteed_item_id = 40753, guaranteed_item_count = 2, gold_min_copper = 30000, gold_max_copper = 50000,
+    reward_items_text = "38082,41600,51809,34067", reward_formulas_text = "45059,44491",
+    reward_mounts_text = "32768,30480",
+    spawn_points_text = "571,4353.573,-4411.8877,151.3909",
 }
+
+local EXT_VALUES = {
+    boss_spawn_yell = "DB喊话-{BOSS_NAME}", boss_enter_combat_yell = "DB进战喊话",
+    ally_spawn_yell = "DB友方喊话", boss_respawn_yell = "DB重生喊话", boss_gm_spawn_yell = "DB GM喊话",
+    taunt_cooldown_seconds = 11, random_taunt_chance = 22,
+    taunt_phase2_yells_text = "DB阶段2嘲讽",
+    taunt_phase3_yells_text = "", taunt_critical_hp_yells_text = "",
+    taunt_skill_cast_yells_text = "DB技能名=DB技能喊话",
+    taunt_target_switch_yells_text = "DB换目标嘲讽", taunt_interrupt_yells_text = "DB打断嘲讽",
+    taunt_kill_yells_text = "DB击杀嘲讽", taunt_low_hp_yells_text = "DB低血嘲讽",
+    taunt_healer_kill_yells_text = "DB治疗击杀嘲讽", taunt_summon_minion_yells_text = "DB召唤嘲讽",
+    taunt_combo_yells_text = "DB连招名=DB连招喊话", taunt_long_combat_yells_text = "DB久战嘲讽",
+    ai_update_interval_ms = 2500,
+    phase2_hp_threshold = 71, phase3_hp_threshold = 21, critical_hp_threshold = 9,
+    low_hp_taunt_threshold = 31, low_hp_taunt_cooldown_ms = 21000,
+    long_combat_taunt_interval_ms = 61000, target_reeval_loops = 4,
+    phase2_summon_count_min = 3, phase2_summon_count_max = 4, phase3_summon_count = 5,
+    phase2_spell_id = 1045, phase3_spell_id = 8600,
+    patrol_enabled = 0, patrol_radius = 66, patrol_leash_radius = 77, patrol_interval_ms = 8000,
+    minion_ai_enabled = 0, minion_ai_interval_ms = 2600, minion_target_range = 55,
+    helper_entries_text = "11111,22222", ally_helper_entry = 20000,
+    class_types_text = "1=melee\n2=healer", class_reward_items_text = "1=40611\n2=40622",
+    managed_tier_entries_text = "190090,190091,190092,190093,190094",
+}
+
+-- 模拟「扩展表已存在、但脚本升级后描述表多了列」的线上状态：
+-- 加载时必须先 ALTER 补列，否则引导写入会因 Unknown column 整条失败。
+local PHASE_COLUMNS = {
+    "phase2_hp_threshold", "phase3_hp_threshold", "critical_hp_threshold",
+    "low_hp_taunt_threshold", "low_hp_taunt_cooldown_ms", "long_combat_taunt_interval_ms",
+    "target_reeval_loops", "phase2_summon_count_min", "phase2_summon_count_max",
+    "phase3_summon_count", "phase2_spell_id", "phase3_spell_id",
+}
+
+local mockExtColumns = { state_key = true, updated_at = true }
+for column in pairs(EXT_VALUES) do mockExtColumns[column] = true end
+for _, column in ipairs(PHASE_COLUMNS) do mockExtColumns[column] = nil end
+
+local function mockInformationSchema(sql)
+    -- 只有扩展表的列状态是「脚本升级后缺列」的模拟状态；其它表按列齐全处理
+    if not sql:find("boss_activity_config_ext", 1, true) then
+        return mockQuery({ 1 })
+    end
+
+    local inList = sql:match("COLUMN_NAME IN %((.-)%)")
+    if inList then
+        local present = 0
+        for name in inList:gmatch("'([%w_]+)'") do
+            if mockExtColumns[name] then present = present + 1 end
+        end
+        return mockQuery({ present })
+    end
+
+    local single = sql:match("COLUMN_NAME = '([%w_]+)'")
+    if single then
+        return mockQuery({ mockExtColumns[single] and 1 or 0 })
+    end
+
+    return mockQuery({ 1 })
+end
+
+-- 按 SELECT 里的列名组装一行数据；缺列直接判失败（描述表加了列而快照没跟上时立刻暴露）
+local function rowFromSelect(sql, values)
+    local columnsText = sql:match("SELECT%s+(.-)%s+FROM")
+    if not columnsText then
+        return nil
+    end
+
+    local row, missing = {}, {}
+    for column in columnsText:gmatch("`([%w_]+)`") do
+        local value = values[column]
+        if value == nil then
+            missing[#missing + 1] = column
+        end
+        row[#row + 1] = value
+    end
+
+    if #missing > 0 then
+        fail("数据库快照缺少列: " .. table.concat(missing, ", "))
+    end
+
+    return mockQuery(row)
+end
 
 local env = setmetatable({}, { __index = _G })
 
 env.CharDBQuery = function(sql)
     table.insert(recorded.sql, { kind = "query", sql = sql })
     if sql:find("information_schema") then
-        return mockQuery({ 1 })
+        return mockInformationSchema(sql)
     end
-    if sql:find("boss_activity_config") and sql:find("SELECT") then
-        return mockQuery(CONFIG_ROW)
+    if sql:find("boss_activity_config_ext", 1, true) and sql:find("SELECT", 1, true) then
+        return rowFromSelect(sql, EXT_VALUES)
+    end
+    if sql:find("boss_activity_config", 1, true) and sql:find("SELECT", 1, true) then
+        return rowFromSelect(sql, CONFIG_VALUES)
     end
     return nil -- runtime / 其它：模拟“没有行”
 end
 
 env.CharDBExecute = function(sql)
     table.insert(recorded.sql, { kind = "execute", sql = sql })
+
+    -- 补列必须真的改变「表结构」，否则后面的查询/写入还是按缺列状态走
+    local addedColumn = sql:match("ADD COLUMN `([%w_]+)`")
+    if addedColumn then
+        if mockExtColumns[addedColumn] then
+            fail("重复补列: " .. addedColumn)
+        end
+        mockExtColumns[addedColumn] = true
+        recorded.alters[#recorded.alters + 1] = addedColumn
+    end
 end
 
 env.WorldDBQuery = env.CharDBQuery
@@ -135,17 +244,86 @@ assertTrue(rawget(env, "activeBossInfo") == nil and rawget(env, "IsManagedBossEn
     "activeBossInfo / IsManagedBossEntry 仍为文件内 local")
 
 -- ------------------------------------------------------ 配置读写 SQL 是否成形
-local configWrites = 0
+-- 主表 = ac_eluna.boss_activity_config（与 AGMP 面板共享）
+-- 扩展表 = ac_eluna.boss_activity_config_ext（脚本私有：喊话/嘲讽/巡逻/小怪/职业）
+local mainConfigWrites, extConfigWrites = 0, 0
+local extCreateSql, extInsertSql, mainInsertSql = nil, nil, nil
+
+-- 精确区分两张表：扩展表名包含主表名，必须用「带反引号的完整表名」判断
+local function isExtConfigSql(sql) return sql:find("`boss_activity_config_ext`", 1, true) ~= nil end
+local function isMainConfigSql(sql)
+    return sql:find("`boss_activity_config`", 1, true) ~= nil and not isExtConfigSql(sql)
+end
+local function isInsertSql(sql) return sql:find("INSERT", 1, true) ~= nil end
+
 for _, item in ipairs(recorded.sql) do
-    if item.sql:find("boss_activity_config") and item.kind == "execute" then
-        configWrites = configWrites + 1
-        assertTrue(item.sql:find("190090", 1, true) ~= nil,
-            "配置写入包含新模板 entry 190090")
-        assertTrue(item.sql:find("`spawn_points_text`", 1, true) ~= nil,
-            "配置写入包含 spawn_points_text 列")
+    if item.kind == "query" and item.sql:find("CREATE TABLE IF NOT EXISTS", 1, true)
+        and isExtConfigSql(item.sql) then
+        extCreateSql = item.sql
+    end
+    if item.kind == "execute" and isExtConfigSql(item.sql) then
+        extConfigWrites = extConfigWrites + 1
+        if isInsertSql(item.sql) and extInsertSql == nil then
+            extInsertSql = item.sql
+        end
+    end
+    if item.kind == "execute" and isMainConfigSql(item.sql) then
+        mainConfigWrites = mainConfigWrites + 1
+        if isInsertSql(item.sql) and mainInsertSql == nil then
+            mainInsertSql = item.sql
+        end
     end
 end
-assertTrue(configWrites >= 1, "启动时会引导式写入 boss_activity_config（INSERT IGNORE）")
+
+assertTrue(mainConfigWrites >= 1, "启动时会引导式写入 boss_activity_config")
+assertTrue(extConfigWrites >= 1, "启动时会引导式写入 boss_activity_config_ext（脚本私有配置）")
+
+if mainInsertSql then
+    assertTrue(mainInsertSql:find("190090", 1, true) ~= nil, "主表配置写入包含新模板 entry 190090")
+    assertTrue(mainInsertSql:find("`spawn_points_text`", 1, true) ~= nil, "主表配置写入包含 spawn_points_text 列")
+    assertTrue(mainInsertSql:find("INSERT IGNORE INTO", 1, true) ~= nil, "引导写入用 INSERT IGNORE（不覆盖已有配置）")
+end
+
+-- REPLACE INTO 会删行重插：面板写在同表、但脚本不认识的列会被重置，所以脚本对
+-- 两张配置表一律不用它（运行时表 boss_activity_runtime 用 REPLACE 是既有行为，不在检查范围）
+local replaceConfigWrites = 0
+for _, item in ipairs(recorded.sql) do
+    if item.kind == "execute" and item.sql:find("REPLACE INTO", 1, true)
+        and item.sql:find("boss_activity_config", 1, true) then
+        replaceConfigWrites = replaceConfigWrites + 1
+    end
+end
+assertTrue(replaceConfigWrites == 0, "配置表写入不再使用 REPLACE INTO（避免清掉面板列）")
+
+-- 扩展表：建表语句与写入语句的列都必须和描述表一致（防止「描述表加了、DDL 忘了加」）
+if extCreateSql and extInsertSql then
+    local createColumns = {}
+    local createBody = extCreateSql:match("%((.*)%) ENGINE") or ""
+    for column in createBody:gmatch("`([%w_]+)`") do
+        createColumns[column] = true
+    end
+
+    local insertColumnsText = extInsertSql:match("%((.-)%) VALUES") or ""
+    local insertColumnCount, missingInCreate = 0, {}
+    for column in insertColumnsText:gmatch("`([%w_]+)`") do
+        insertColumnCount = insertColumnCount + 1
+        if not createColumns[column] then
+            missingInCreate[#missingInCreate + 1] = column
+        end
+    end
+
+    assertTrue(insertColumnCount >= 32, "扩展表写入覆盖所有配置列（当前 " .. insertColumnCount .. " 列）")
+    assertTrue(#missingInCreate == 0,
+        "扩展表写入的每一列都在建表语句里" .. (#missingInCreate > 0 and ("（缺: " .. table.concat(missingInCreate, ",") .. "）") or ""))
+
+    for _, column in ipairs({
+        "boss_spawn_yell", "taunt_kill_yells_text", "taunt_combo_yells_text",
+        "patrol_enabled", "minion_ai_interval_ms", "helper_entries_text",
+        "class_reward_items_text", "managed_tier_entries_text",
+    }) do
+        assertTrue(createColumns[column] == true, "扩展表建表语句含列 " .. column)
+    end
+end
 
 local runtimeWrites = 0
 for _, item in ipairs(recorded.sql) do
@@ -154,6 +332,31 @@ for _, item in ipairs(recorded.sql) do
     end
 end
 assertTrue(runtimeWrites >= 1, "启动时写入了 boss_activity_runtime 引导行")
+
+-- 扩展表迁移：桩状态里故意缺 12 个 [phase] 列，加载时必须先补列再写配置，
+-- 否则线上遇到「脚本升级后描述表多了列」会整条写入失败（配置改了却不生效）
+io.write("\n== 扩展表缺列迁移 ==\n")
+assertTrue(#recorded.alters >= #PHASE_COLUMNS,
+    string.format("自动补列 %d 个（缺 %d 个 [phase] 列）", #recorded.alters, #PHASE_COLUMNS))
+local missingPhaseColumns = {}
+for _, column in ipairs(PHASE_COLUMNS) do
+    if not mockExtColumns[column] then missingPhaseColumns[#missingPhaseColumns + 1] = column end
+end
+assertTrue(#missingPhaseColumns == 0,
+    "补列后扩展表列齐全" .. (#missingPhaseColumns > 0 and ("（缺: " .. table.concat(missingPhaseColumns, ",") .. "）") or ""))
+
+local firstAlterIndex, firstExtInsertIndex = nil, nil
+for index, item in ipairs(recorded.sql) do
+    if item.kind == "execute" and item.sql:find("ADD COLUMN", 1, true) and firstAlterIndex == nil then
+        firstAlterIndex = index
+    end
+    if item.kind == "execute" and isExtConfigSql(item.sql) and isInsertSql(item.sql)
+        and firstExtInsertIndex == nil then
+        firstExtInsertIndex = index
+    end
+end
+assertTrue(firstAlterIndex ~= nil and firstExtInsertIndex ~= nil and firstAlterIndex < firstExtInsertIndex,
+    "补列发生在扩展表写入之前（顺序：ALTER → INSERT）")
 
 -- ------------------------------------------------------------ 命令驱动与断言
 local cases = {
@@ -178,6 +381,83 @@ for _, case in ipairs(cases) do
     assertTrue(markers:find(case.expect, 1, true) ~= nil,
         case.name .. " 返回 " .. case.expect .. "（面板可据此判定成功/失败）")
 end
+
+-- 配置展示 + 「运行时以数据库为准」：ext 表里的值必须真的生效，而不是被默认值盖掉
+io.write("\n== .boss config show ==\n")
+local groupMessages = runConsoleCommand("boss config show")
+local groupText = table.concat(groupMessages, " | ")
+assertTrue(#groupMessages > 0, ".boss config show 有输出")
+local groupKeys = {
+    "identity", "basic", "ally", "yells", "taunts", "ai", "phase", "patrol",
+    "minion", "skill", "respawn", "spawnpoints", "helper", "reward", "class", "tier",
+}
+local missingGroups = {}
+for _, group in ipairs(groupKeys) do
+    if not groupText:find(group, 1, true) then missingGroups[#missingGroups + 1] = group end
+end
+assertTrue(#missingGroups == 0, "配置分组齐全（16 组）" ..
+    (#missingGroups > 0 and ("（缺: " .. table.concat(missingGroups, ",") .. "）") or ""))
+
+-- 各组声明的项数之和必须等于描述表总数（漏登记会立刻暴露）
+local listedTotal = 0
+for count in groupText:gmatch("（(%d+) 项）") do
+    listedTotal = listedTotal + tonumber(count)
+end
+assertTrue(listedTotal >= 78, "分组项数之和覆盖全部配置项（当前 " .. listedTotal .. "）")
+
+local function showGroup(group)
+    return table.concat(runConsoleCommand("boss config show " .. group), " | ")
+end
+
+local yellsText = showGroup("yells")
+assertTrue(yellsText:find("DB喊话-{BOSS_NAME}", 1, true) ~= nil,
+    "喊话取自 boss_activity_config_ext（DB 值生效）")
+assertTrue(yellsText:find("打爆这个垃圾服务器", 1, true) == nil,
+    "喊话未回落到文件内默认值（说明 ext 表确实覆盖了默认配置）")
+
+local tauntText = showGroup("taunts")
+assertTrue(tauntText:find("DB击杀嘲讽", 1, true) ~= nil, "嘲讽列表取自 ext 表（多行文本解析正确）")
+assertTrue(tauntText:find("DB技能名=DB技能喊话", 1, true) ~= nil, "键值型嘲讽（技能名=喊话）解析正确")
+assertTrue(tauntText:find("11", 1, true) ~= nil and tauntText:find("22", 1, true) ~= nil,
+    "嘲讽冷却/概率取自 ext 表")
+
+local patrolText = showGroup("patrol")
+assertTrue(patrolText:find("false", 1, true) ~= nil, "patrol_enabled=0 解析为 false")
+assertTrue(patrolText:find("66", 1, true) ~= nil, "patrol_radius 取自 ext 表")
+
+local helperText = showGroup("helper")
+assertTrue(helperText:find("11111,22222", 1, true) ~= nil, "援军 entry 列表取自 ext 表")
+assertTrue(helperText:find("20000", 1, true) ~= nil, "友方援军 entry 取自 ext 表")
+
+local tierText = showGroup("tier")
+assertTrue(tierText:find("190090,190091,190092,190093,190094", 1, true) ~= nil,
+    "受管档位模板取自 ext 表")
+
+local classText = showGroup("class")
+assertTrue(classText:find("1=melee", 1, true) ~= nil,
+    "职业类型映射（键值文本 1=melee）解析正确")
+assertTrue(classText:find("1=40611", 1, true) ~= nil,
+    "职业奖励池（键=物品列表）解析正确")
+
+-- 战斗阶段阈值/阶段法术/召唤数量原先写死在 AI 里，现在必须来自配置
+local phaseText = showGroup("phase")
+assertTrue(phaseText:find("phase2_hp_threshold (phase2HpThreshold) = 71", 1, true) ~= nil,
+    "阶段阈值 phase2HpThreshold 取自 ext 表")
+assertTrue(phaseText:find("phase3_hp_threshold (phase3HpThreshold) = 21", 1, true) ~= nil,
+    "阶段阈值 phase3HpThreshold 取自 ext 表")
+assertTrue(phaseText:find("phase2_spell_id (phase2SpellId) = 1045", 1, true) ~= nil,
+    "阶段法术 phase2SpellId 取自 ext 表")
+assertTrue(phaseText:find("phase3_summon_count (phase3SummonCount) = 5", 1, true) ~= nil,
+    "阶段召唤数量 phase3SummonCount 取自 ext 表")
+assertTrue(phaseText:find("target_reeval_loops (targetReevalLoops) = 4", 1, true) ~= nil,
+    "目标重评估间隔 targetReevalLoops 取自 ext 表")
+
+local badGroupMessages = runConsoleCommand("boss config show nonsense")
+local badMarkers = markersOf(badGroupMessages)
+assertTrue(badMarkers:find("AGMP_ERROR", 1, true) ~= nil, "未知配置分组返回 AGMP_ERROR")
+
+local badUsage = markersOf(runConsoleCommand("boss config oops"))
+assertTrue(badUsage:find("AGMP_ERROR", 1, true) ~= nil, ".boss config <未知子命令> 返回 AGMP_ERROR")
 
 -- 非 boss 命令必须放行（返回 true 表示交给核心继续处理）
 io.write("\n== 非 boss 命令放行 ==\n")
@@ -211,6 +491,10 @@ for _, entry in ipairs({ "190090", "190091", "190092", "190093" }) do
     end
     assertTrue(complete, "entry " .. entry .. " 的 creature 事件齐全(1/2/3/4/5/9)")
 end
+-- ext 表里的 managed_tier_entries_text 多带了一个 190094（文件内默认没有）：
+-- 它也被注册事件，说明「受管模板」确实以数据库为准
+assertTrue(engineCallbacks.creature["190094/1"] ~= nil,
+    "受管模板 entry 由 ext 表驱动（190094 也注册了事件）")
 
 -- --------------------------------------------------------------------- 汇总
 -- 可选：把本次运行生成的所有 SQL 落盘，便于人工复核语句是否符合预期。

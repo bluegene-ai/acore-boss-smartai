@@ -1,5 +1,23 @@
 # release/80 自定义 SQL
 
+## 活动 Boss 脚本私有配置表（2026_09_24_activity_boss_config_ext.sql）
+
+`boss.lua` 把原先写死在脚本里的喊话 / 战斗嘲讽 / 巡逻 / 小怪节奏 / 职业奖励 /
+受管模板等配置搬进了 `ac_eluna.boss_activity_config_ext`（**不是** `boss_activity_config`：
+AGMP 保存主表时用 `REPLACE INTO` 重写整行，会把它不认识的列重置为默认值）。
+
+- 正常情况下**不需要手工执行这个文件**：`boss.lua` 每次加载都会
+  `CREATE TABLE IF NOT EXISTS`（列由脚本 §3 配置区的 `BOSS_CONFIG_SCHEMA_EXT` 生成），
+  首次加载还会用 `INSERT IGNORE` 写入默认值。
+- 该文件用于 DBA 预建表 / 账号无建表权限时代建 / 人工复核列定义；
+  已校验：其 DDL 与脚本生成的建表语句逐列一致（列名、类型、默认值、顺序）。
+- 加配置项的正确做法：改 `boss.lua` §3 的描述表（并同步本文件与面板 `config/boss.php`），不要只手改数据库。
+- AGMP 面板的「扩展配置」Tab 可以直接编辑这张表（二级 Tab 按分组归集），
+  写入用 `INSERT ... ON DUPLICATE KEY UPDATE`（只改提交的列，不会像主表那样被 `REPLACE INTO` 重置）。
+- 查看当前生效值：`.boss config show` / `.boss config show <分组>`
+  （分组：identity basic ally yells taunts ai phase patrol minion skill respawn
+  spawnpoints helper reward class tier）。
+
 ## 活动 Boss 难度档位（2026_09_23_activity_boss_tiers_190090_190093.sql）
 
 新建 4 个**活动 Boss 专用模板**，供 AGMP 面板「Boss 活动管理 → 难度档位」切换。
@@ -49,6 +67,7 @@
 | `.boss clear` | 直接移除活跃 Boss、不发奖励、复位运行时记录（面板「重置」按钮） |
 | `.boss rebase` | 按模板重算基准血量再套用倍率（**需脱战**，战斗中会拒绝） |
 | `.boss config reload` | 从 `ac_eluna` 热加载配置（面板保存后自动调用） |
+| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 16 个分组） |
 | `.boss preset list` / `.boss preset <key>` | 查看 / 切换技能池预设 |
 | `.boss difficulty list` / `.boss difficulty <key>` | 查看 / 切换技能节奏档位 |
 | `.boss help` | 帮助 |

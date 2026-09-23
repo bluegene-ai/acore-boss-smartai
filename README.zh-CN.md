@@ -6,7 +6,9 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 - 智能战斗 AI、多套技能池预设与技能节奏档位。
 - **可切换的强度档位**，由专用 `creature_template` 承载（见下）。
-- 运行时数据落在 `ac_eluna`：`boss_activity_runtime`、`boss_activity_config`、`boss_activity_events`、`boss_activity_contributors`。
+- **配置全部落库**：脚本里只保留默认值，运行期以 `ac_eluna` 为准（见下「配置在哪里改」）。
+- 运行时数据落在 `ac_eluna`：`boss_activity_runtime`、`boss_activity_config`、
+  `boss_activity_config_ext`、`boss_activity_events`、`boss_activity_contributors`。
 - 表结构由 Lua 自举与迁移（不需要 Web 端建表）。
 - 活动 Boss 使用**专用模板**，不再复用副本 Boss，因此不会和核心 `SmartAI` 形成双 AI。
 - 命令：
@@ -18,9 +20,52 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 | `.boss clear`（别名 `.boss despawn`） | 直接移除活跃 Boss、不发奖励并复位运行时记录 |
 | `.boss rebase` | 按模板重算基准血量再套用倍率（**仅脱战可用**） |
 | `.boss config reload` | 从 `ac_eluna` 热加载配置（AGMP 保存后自动调用） |
+| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 16 个分组） |
 | `.boss preset list` / `.boss preset <key>` | 查看 / 切换技能池预设 |
 | `.boss difficulty list` / `.boss difficulty <key>` | 查看 / 切换技能节奏档位 |
 | `.boss help` | 帮助 |
+
+## 配置在哪里改
+
+`boss.lua` 只在文件顶部 §3「配置区」保留**出厂默认值**；数据库里已有该行时，
+默认值不生效（引导写入用 `INSERT IGNORE`）。改配置按优先级：
+
+1. **AGMP 面板** —— 「基础配置」Tab 改主表 `boss_activity_config` 的列（Boss 身份/属性/刷新点/技能池/奖励）；
+   「扩展配置」Tab 改 `boss_activity_config_ext`（喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板，
+   内部再按二级 Tab 分组）。
+2. **直接改数据库** —— `boss_activity_config`（面板共享列）与 `boss_activity_config_ext`（脚本私有列）都可以。
+3. 改脚本 §3 的默认值 —— 只影响「数据库里还没有这一行」的全新部署。
+
+改完执行 `.boss config reload`（面板保存会自动执行），或重启 worldserver。
+
+### 两张配置表的分工
+
+| 表 | 内容 | 谁写 |
+|---|---|---|
+| `boss_activity_config` | Boss 身份、等级/体型/血量倍率、光环、友方援军、刷新点、技能池、奖励 | AGMP 面板（`REPLACE INTO` 整行重写）+ Lua |
+| `boss_activity_config_ext` | 喊话、战斗嘲讽（12 组文本）、AI 节奏、战斗阶段阈值、巡逻、小怪 AI、援军模板、职业类型与职业奖励池、受管模板 | Lua 建表/引导 + AGMP 面板（`INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列） |
+
+为什么拆两张表：AGMP 保存主表时用 `REPLACE INTO` 重写整行，凡不在它列清单里的列
+都会被重置为建表默认值，脚本私有配置放主表会被面板保存清掉，所以单独一张表；
+面板对 ext 表只做 upsert，因此脚本后续新增的列不会被面板保存重置。
+
+### 加一个配置项
+
+1. 在 §3 配置区加默认值（或复用已有字段）；
+2. 在 `BOSS_CONFIG_SCHEMA_MAIN`（面板共享列，需同时改 AGMP 与建表语句）或
+   `BOSS_CONFIG_SCHEMA_EXT`（脚本私有列）里加一行：`group / column / kind / target / key`，ext 列还要给 `ddl`；
+3. ext 表的建表语句、读、写、`.boss config show` 展示都会自动跟着变；如果要能在面板里编辑，
+   再到 AGMP 的 `config/boss.php` 补 `ext_fields`（列名/类型/边界）+ 中英文语言的字段名，
+   `php tools/verify_boss_ext_page.php` 会逐列比对脚本与面板是否一致。
+
+配置项的取值类型（`kind`）：`int` / `bool` / `scaled`（小数 ×100 存 INT）/ `text` /
+`text_keep` / `intlist` / `lines` / `keyedlines` / `keyedword` / `keyedintlist` / `spawnpoints`。
+
+### 仍然写在脚本里的东西（不是配置项）
+
+- 技能池预设 / 强度档位系数 / 打断法术池（§5 内容库）：属于「技能内容」，改动等于改战斗设计，随版本发布；
+  可调的部分（选哪套预设、哪个档位）已经落库。
+- 显示用文本（职业中文名等）、小怪召唤的散布半径、技能条件里的个别常量：属于逻辑常量，不是调参项。
 
 ## 难度档位
 
@@ -57,7 +102,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 ## 不启动服务器也能测
 
-`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 27 项不变量：加载流程、SQL 构造、命令标记、`.boss clear` 副作用、事件注册，以及上面两处回归（"未覆盖全局 print"、"未泄漏全局变量"）。用法见 `tools/boss-lua-smoke/README.md`。
+`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 63 项不变量：加载流程、两张配置表的 SQL 构造、扩展表建表/写入列一致性、命令标记、`.boss config show` 输出、「数据库值确实覆盖脚本默认值」、`.boss clear` 副作用、事件注册，以及上面两处回归（"未覆盖全局 print"、"未泄漏全局变量"）。用法见 `tools/boss-lua-smoke/README.md`。
 
 ```
 lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
@@ -105,8 +150,12 @@ lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
 ### 关键约定
 
 - AGMP 的 Boss 模块指向 `ac_eluna`。
+- 面板对两张表用的写法不同：`boss_activity_config` 用 `REPLACE INTO` 整行重写（列清单写死在
+  `BossRepository`），`boss_activity_config_ext` 用 `INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列。
+  因此：给主表加列必须同步改面板，否则会被面板保存重置；给 ext 表加列则不会被面板影响。
 - `boss_activity_config` 必须含 `spawn_points_text` 列。
 - SOAP 账号需要有执行 Boss 命令的权限。
+- 面板「扩展配置」Tab 的字段与脚本描述表由 `php tools/verify_boss_ext_page.php` 逐列比对（含中英文文案）。
 
 ## 安全与运维
 

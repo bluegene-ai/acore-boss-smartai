@@ -2,6 +2,24 @@
 -- 功能：智能BOSS战斗系统
 -- 特性：智能目标选择、技能连招、战术移动、环境感知、支持web管理
 -- 作者：pureland.fun
+--
+-- ============================================================================
+--  文件结构（按出现顺序；查找配置请直接跳到「配置区」）
+-- ----------------------------------------------------------------------------
+--   §1 日志系统                  boss.log 轮转 + 文件级 print 遮蔽
+--   §2 常量                      库名 / state_key / 配置键
+--   §3 配置区  ★                所有可调项的默认值（分组）+ 描述表 + 目标注册表
+--   §4 数据库表结构自举          ac_eluna 四张表 + 配置扩展表（列由描述表生成）
+--   §5 内容库                    技能池预设 / 强度档位 / 打断法术（非配置项）
+--   §6 序列化与 SQL 工具         clamp / 列表与键值文本 / 查询取值助手
+--   §7 配置读写                  描述表驱动：LoadBossConfigFromDB / PersistBossConfigToDB
+--   §8 运行期状态                内存态（活跃 Boss、AI 状态、贡献统计…）
+--   §9 通用工具 / 贡献统计 / 喊话 / 目标选择 / 技能决策 / 战术移动 / 巡逻
+--   §10 Boss 生成与管理 / 事件处理 / GM 命令 / 事件注册
+--
+--  ★ 配置不再散落在脚本各处：所有可调项都在 §3 登记，运行期以数据库为准。
+--    表结构、列名、读写方式见 §3 描述表与 §4/§7。
+-- ============================================================================
 local basePrint = print
 
 -- ========== 日志系统 ==========
@@ -54,10 +72,17 @@ local print = BossLog
 
 basePrint(">>Script:BOSS SmartAI loading...OK")
 
-local BOSS_DB_NAME = "ac_eluna"
-local BOSS_RUNTIME_KEY = "current"
-local BOSS_CONFIG_KEY = "current"
-local BOSS_DECIMAL_SCALE = 100
+-- ========== §2 常量（不属于可调配置，改动需随版本发布） ==========
+-- 日志路径/轮转上限在 §1 里另有常量：日志先于数据库可用，不能落库。
+local BOSS_DB_NAME = "ac_eluna"                              -- 配置与运行态所在库
+local BOSS_RUNTIME_KEY = "current"                           -- boss_activity_runtime 的 state_key
+local BOSS_CONFIG_KEY = "current"                            -- 配置表的 state_key
+local BOSS_DECIMAL_SCALE = 100                               -- 小数落库缩放（倍率/体型 ×100 存 INT）
+local BOSS_MAIN_TABLE = "boss_activity_config"               -- 与 AGMP 面板共享的配置表
+local BOSS_EXT_TABLE = "boss_activity_config_ext"            -- 脚本私有配置表（面板用 upsert 只改提交的列，不会删行重置）
+local BOSS_RUNTIME_TABLE = "boss_activity_runtime"           -- 运行态（活跃 Boss 指针/时间戳）
+local BOSS_EVENT_TABLE = "boss_activity_events"              -- 事件流水
+local BOSS_CONTRIBUTOR_TABLE = "boss_activity_contributors"  -- 贡献快照
 local BOSS_SCHEMA_READY = false
 
 -- 【前置声明】以下名字在文件后段才赋值。Lua 只在「声明之后」的代码里把它们当 local，
@@ -71,6 +96,8 @@ local DEFAULT_SPAWN_POINTS
 local activeBossInfo
 local RegisterBossEventsForEntry
 local RegisterBossEventsForCandidates
+local BossSendMessage
+local BossReply
 
 local function BossNow()
     local success, gameTime = pcall(function() return GetGameTime() end)
@@ -84,32 +111,67 @@ local function BossNow()
     return os.time()
 end
 
--- ========== 配置段 ==========
+-- ============================================================================
+--  §3 配置区 ★ 本脚本唯一的配置文件
+-- ----------------------------------------------------------------------------
+--  下面「默认值」只在数据库里还没有这一行时使用（引导写入 INSERT IGNORE）；
+--  一旦落库，之后每次加载都以数据库为准，改默认值不会影响已上线的服务器。
+--
+--  两张表（详见 §7 读写实现）：
+--    ac_eluna.boss_activity_config      —— 与 AGMP 面板共享的列（面板「基础配置」Tab）
+--    ac_eluna.boss_activity_config_ext  —— 脚本私有配置：喊话 / 嘲讽 / AI 节奏 /
+--                                          阶段阈值 / 巡逻 / 小怪 / 援军模板 / 职业 / 受管模板
+--                                          （面板「扩展配置」Tab，按二级 Tab 分组展示）
+--  为什么要拆表：AGMP 保存主表时用 REPLACE INTO 整行重写，凡不在它列清单里的列都会被
+--  重置为建表默认值；脚本私有配置放在 ext 表里，面板只能用 upsert 逐列改，删列/换列都
+--  不会把脚本新增的配置清掉。
+--
+--  分组（descriptor.group，`.boss config show <group>` 可查看当前生效值）：
+--    identity   Boss 身份      basic    基础属性       ally    友方援军
+--    yells      喊话           taunts   战斗嘲讽       ai      AI 节奏
+--    phase      战斗阶段       patrol   巡逻           minion  小怪与援军
+--    skill      技能池         respawn  刷新间隔       spawnpoints 刷新点
+--    helper     援军模板       reward   奖励           class   职业
+--    tier       受管模板
+--
+--  改配置：① AGMP 面板（基础配置 + 扩展配置两个 Tab）② 直接改数据库（两张表）
+--          ③ 改这里（只影响「数据库里还没有这一行」的全新部署）
+--          改完执行 `.boss config reload` 热加载，或重启 worldserver。
+-- ============================================================================
 
--- ========== Boss特性配置 ==========
--- 所有可配置参数集中在此，便于调整平衡性
+-- ---- [identity] Boss 身份：活动 Boss 的模板 entry 与显示名 ----
+-- 这是默认项；启动时会以 ac_eluna.boss_activity_config 的 boss_entry/boss_name 覆盖。
+-- 强度档位 = entry：190090 入门 / 190091 标准 / 190092 困难 / 190093 团本（见 [tier]）。
+local BOSS_CANDIDATES = {
+    {entry = 190090, name = "送财童子"},
+}
+
+-- ---- [basic] 基础属性 / 光环，[ally] 友方援军，[yells] 喊话，[taunts] 战斗嘲讽，
+-- ---- [ai] AI 节奏，[patrol] 巡逻，[minion] 小怪，[skill] 技能池，[respawn] 刷新间隔 ----
+-- 说明：Boss/小怪属性、喊话与嘲讽文案、巡逻与小怪 AI 节奏、技能池选择都能落库，
+--       面板列与 ext 列的对应关系见下面的 BOSS_CONFIG_SCHEMA_* 描述表。
 local BOSS_CONFIG = {
-    -- 【基础属性配置】
+    -- ---- [basic] 基础属性 ----
     bossLevel = 83,                    -- Boss等级（影响基础属性）
     bossScale = 5,                     -- Boss体型缩放倍数（1为正常大小）
     bossHealthMultiplier = 20,        -- Boss血量倍率（基础血量×此值）
     
-    -- 【Boss自带BUFF】
+    -- ---- [basic] Boss 自带 BUFF ----
     -- 21562=真言术：韧  1126=野性印记  467=献祭光环  20217=王者祝福
     bossAuras = {21562, 1126, 467, 20217},
     
-    -- 【友方援军配置】
+    -- ---- [ally] 友方援军（米尔豪斯） ----
     allyLevel = 20,                    -- 友方援军（米尔豪斯）等级
     allyHealthMultiplier = 1.5,        -- 友方援军血量倍率
     
-    -- 【喊话配置】支持{BOSS_NAME}占位符
+    -- ---- [yells] 喊话（支持 {BOSS_NAME} 占位符） ----
     bossSpawnYell = " 让 {BOSS_NAME} 来打爆这个垃圾服务器！",  -- 生成时喊话
     bossEnterCombatYell = "可恶，竟敢对我动手！",              -- 进入战斗喊话
     allySpawnYell = "保卫净土的时候到了！援护勇士，击倒这恶徒！", -- 友方援军喊话
     bossRespawnYell = "{BOSS_NAME}再临！",                     -- 重生时喊话
     bossGMSpawnYell = "小虫子们，来战！",                      -- GM命令生成时喊话
     
-    -- 【战斗嘲讽喊话配置】
+    -- ---- [taunts] 战斗嘲讽 ----
     -- 支持占位符: {PLAYER_NAME}=玩家名, {CLASS}=职业名, {SPELL}=技能名
     combatTaunts = {
         -- 血量阶段喊话
@@ -261,41 +323,538 @@ local BOSS_CONFIG = {
         },
     },
     
-    -- 喊话冷却时间（秒）
+    -- ---- [taunts] 喊话冷却与触发概率 ----
     tauntCooldown = 8,
     
     -- 随机喊话概率（%）
     randomTauntChance = 15,
     
-    -- 【刷新配置】
+    -- ---- [respawn] 刷新间隔 ----
     respawnTimeMinutes = 10,            -- Boss重生间隔（分钟）
     
-    -- 【敌方援军配置】
+    -- ---- [minion] 小怪数量（进入战斗时召唤） ----
     minionCountMin = 1,                -- 进入战斗时召唤援军数量（最小）
     minionCountMax = 2,                -- 进入战斗时召唤援军数量（最大）
     
-    -- 【AI核心配置】
+    -- ---- [ai] AI 决策节奏 ----
     aiUpdateInterval = 1500,           -- AI决策间隔（毫秒），值越小反应越快
 
-    -- 【巡逻配置】
+    -- ---- [phase] 战斗阶段与触发阈值 ----
+    -- 血量阶段：> phase2 为一阶段，(phase3, phase2] 为二阶段，<= phase3 为三阶段
+    phase2HpThreshold = 70,            -- 进入二阶段的血量百分比
+    phase3HpThreshold = 20,            -- 进入三阶段的血量百分比
+    criticalHpThreshold = 10,          -- 触发「濒死嘲讽」的血量百分比
+    lowHpTauntThreshold = 30,          -- 对低血量目标嘲讽的触发线（目标血量%）
+    lowHpTauntCooldownMs = 20000,      -- 低血量目标嘲讽冷却（毫秒）
+    longCombatTauntIntervalMs = 60000, -- 战斗时长累计多少毫秒做一次随机嘲讽
+    targetReevalLoops = 3,             -- 每 N 次 AI 循环重新评估一次目标
+    phase2SummonCountMin = 1,          -- 二阶段召唤小怪数量（最小）
+    phase2SummonCountMax = 2,          -- 二阶段召唤小怪数量（最大）
+    phase3SummonCount = 2,             -- 三阶段召唤小怪数量
+    phase2SpellId = 1044,              -- 二阶段自身法术（1044=自由祝福，0=不施放）
+    phase3SpellId = 8599,              -- 三阶段自身法术（8599=狂暴，0=不施放）
+
+    -- ---- [patrol] 巡逻 ----
     patrolEnabled = true,              -- Boss 脱战时是否在刷新点附近巡逻
     patrolRadius = 50,                 -- 巡逻随机移动半径（码）
     patrolLeashRadius = 100,            -- 巡逻允许偏离刷新点的最大半径（码）
     patrolInterval = 9000,             -- 巡逻检查间隔（毫秒）
 
-    -- 【小怪AI配置】
+    -- ---- [minion] 小怪 AI ----
     minionAiEnabled = true,            -- 召唤小怪是否启用脚本智能行为
     minionAiInterval = 1800,           -- 小怪智能决策间隔（毫秒）
     minionTargetRange = 40,            -- 小怪搜索玩家范围（码）
 
-    -- 【技能池预设】
+    -- ---- [skill] 技能池选择 ----
     -- 可选: storm_siege / ember_storm / frost_whiteout / venom_pursuit / grave_bombard / spellbreak_bulwark
     skillPreset = "storm_siege",
 
-    -- 【技能池强度档位】
+    -- ---- [skill] 技能池强度档位 ----
     -- 可选: easy / standard / hard / raid
     skillDifficulty = "standard",
 }
+
+-- ---- [spawnpoints] 刷新点：Boss 重生时随机选取的坐标 ----
+-- mapId: 地图ID（571=诺森德）；x/y/z: 坐标。
+-- 落库列：boss_activity_config.spawn_points_text（每行 "mapId,x,y,z"）；
+-- 该列为空/无有效行时回退到下面这份默认点。
+local function CloneSpawnPoints(points)
+    local cloned = {}
+    if type(points) ~= "table" then
+        return cloned
+    end
+
+    for _, point in ipairs(points) do
+        if type(point) == "table" then
+            table.insert(cloned, {
+                mapId = tonumber(point.mapId) or 0,
+                x = tonumber(point.x) or 0,
+                y = tonumber(point.y) or 0,
+                z = tonumber(point.z) or 0,
+            })
+        end
+    end
+
+    return cloned
+end
+
+local SPAWN_POINTS = {
+    {mapId = 571, x = 4353.573, y = -4411.8877, z = 151.3909},   -- 灰熊丘陵月溪旅营地西南
+    {mapId = 571, x = 1246.5499, y = -4311.5073, z = 144.944},   -- 嚎风峡湾乌堡西
+    {mapId = 571, x = 8093.9595, y = 2827.9702, z = 553.28033},  -- 冰冠冰川哭泣采掘场
+    {mapId = 571, x = 6689.081, y = 500.4722, z = 401.2109},     -- 冰冠冰川天灾城
+    {mapId = 571, x = 2975.7952, y = 5373.769, z = 62.121082},   -- 北风苔原
+    {mapId = 571, x = 6005.9688, y = 5612.9023, z = -71.26319},  -- 索拉查盆地生命守卫者之路
+    {mapId = 571, x = 8355.781, y = -44.54596, z = 815.31604},   -- 风暴峭壁雪流平原
+}
+
+DEFAULT_SPAWN_POINTS = CloneSpawnPoints(SPAWN_POINTS)
+
+-- ---- [helper] 援军模板 entry ----
+-- HELPER_ENTRIES: Boss进入战斗时召唤的敌方援军（小怪）
+local HELPER_ENTRIES = {16244, 15976, 16018, 16165}
+
+-- ALLY_HELPER_ENTRY: 友方援军（帮助玩家攻击Boss）
+-- 20977 = 米尔豪斯·法力风暴
+local ALLY_HELPER_ENTRY = 20977
+
+-- ---- [reward] 奖励 ----
+-- 所有概率值为0-100的整数，表示百分比
+local REWARD_PROBABILITIES = {
+    classRewardChance = 60,    -- 职业专属装备奖励概率（%）
+    formulaRewardChance = 10,  -- 公式奖励概率（%）
+    mountRewardChance = 15,    -- 坐骑奖励概率（%）
+
+    -- 【保底奖励配置】
+    -- 所有参与战斗的玩家均可获得（不限制人数）
+    guaranteedRewardEnabled = true,      -- 是否启用保底奖励
+    guaranteedRewardNotify = true,       -- 是否发送获得通知
+
+    -- 【随机奖励人数配置】
+    maxRandomRewardPlayers = 3,          -- 最多多少名玩家可获得随机奖励（原奖励体系）
+    participationRange = 80,             -- 统计战斗贡献时使用的有效范围（码）
+    damageWeight = 100,                  -- 输出贡献权重
+    healingWeight = 80,                  -- 治疗贡献权重
+    threatWeight = 35,                   -- 承伤/仇恨存在感权重
+    presenceWeight = 10,                 -- 在场活跃权重（仅作微调，不单独决定资格）
+    killWeight = 3,                      -- 最后一击加权
+    randomRewardMode = "weighted",      -- weighted=按贡献加权；random=均匀随机
+
+    -- 验证函数：确保概率值在0-100范围内
+    validate = function(self)
+        local function clamp(value)
+            return math.max(0, math.min(100, value))
+        end
+        self.classRewardChance = clamp(self.classRewardChance)
+        self.formulaRewardChance = clamp(self.formulaRewardChance)
+        self.mountRewardChance = clamp(self.mountRewardChance)
+        self.damageWeight = math.max(0, self.damageWeight or 0)
+        self.healingWeight = math.max(0, self.healingWeight or 0)
+        self.threatWeight = math.max(0, self.threatWeight or 0)
+        self.presenceWeight = math.max(0, self.presenceWeight or 0)
+        self.killWeight = math.max(0, self.killWeight or 0)
+        self.participationRange = math.max(20, self.participationRange or 80)
+        if self.randomRewardMode ~= "random" then
+            self.randomRewardMode = "weighted"
+        end
+        return self
+    end
+}
+REWARD_PROBABILITIES:validate()
+
+-- 【奖励物品池】
+-- REWARD_ITEMS: 必掉的（100%概率给一个）
+local REWARD_ITEMS = {38082, 41600, 51809, 34067}
+
+-- REWARD_FORMULAS: 公式奖励（概率触发，见REWARD_PROBABILITIES.formulaRewardChance）
+-- 45059=附魔公式  44491=附魔公式
+local REWARD_FORMULAS = {45059, 44491}
+
+-- REWARD_MOUNTS: 稀有坐骑（概率触发，见REWARD_PROBABILITIES.mountRewardChance）
+local REWARD_MOUNTS = {32768,30480,13335,37719,49282,49290,19872,33977,33809,37828,43963,54068,33183,33189,35513,43964,19902,43963,46109,50250,49286,30609,54860,37012}
+
+-- REWARD_GUARANTEED: 所有参与者的保底奖励配置
+local REWARD_GUARANTEED = {
+    itemId = 40753,
+    count = 2,
+}
+
+-- REWARD_GOLD: 随机奖励获奖者的金币奖励配置（单位：铜）
+local REWARD_GOLD = {
+    minCopper = 30000,
+    maxCopper = 50000,
+}
+
+-- ---- [class] 职业 ----
+-- 【职业类型定义】用于AI目标选择策略
+-- melee=近战（优先度低）  ranged=远程（优先度中）  healer=治疗（优先度高）
+-- 第三阶段会优先攻击healer类型
+local CLASS_TYPES = {
+    [1] = "melee",    -- 战士
+    [2] = "healer",   -- 圣骑士（可切换为近战，但AI视为治疗威胁）
+    [3] = "ranged",   -- 猎人
+    [4] = "melee",    -- 盗贼
+    [5] = "healer",   -- 牧师
+    [6] = "melee",    -- 死亡骑士
+    [7] = "healer",   -- 萨满（可切换，AI视为治疗威胁）
+    [8] = "ranged",   -- 法师
+    [9] = "ranged",   -- 术士
+    [11] = "healer",  -- 德鲁伊（可切换，AI视为治疗威胁）
+}
+
+-- 【职业专属奖励】按职业分类的装备奖励
+-- 键=职业ID（1=战士, 2=圣骑, 3=猎人, 4=盗贼, 5=牧师, 6=DK, 7=萨满, 8=法师, 9=术士, 11=德鲁伊）
+-- 值=装备ID数组，随机选择一个
+local CLASS_REWARD_ITEMS = {
+    [1] = {40611,40614,40617,40620,40623,40256,40371,39257,40431,40257,40372}, -- 战士
+    [2] = {40622,40619,40616,40613,40610,40256,40371,39257,40431,40257,40372,40258,40382,39299}, -- 圣骑士
+    [3] = {40611,40614,40617,40620,40623,40256,40371,39257,40431}, -- 猎人
+    [4] = {40624,40621,40618,40615,40612,40256,40371,39257,40431}, -- 盗贼
+    [5] = {40622,40619,40616,40613,40610,40255,40373,40432,40258,40382,39299}, -- 牧师
+    [6] = {40624,40621,40618,40615,40612,40256,40371,39257,40431,40257,40372}, -- 死亡骑士
+    [7] = {40611,40614,40617,40620,40623,40255,40373,40432,40256,40371,39257,40431,40258,40382,39299}, -- 萨满
+    [8] = {40624,40621,40618,40615,40612,40255,40373,40432,39299}, -- 法师
+    [9] = {40622,40619,40616,40613,40610,40255,40373,40432,39299}, -- 术士
+    [11] = {40624,40621,40618,40615,40612,40255,40373,40432,40256,40371,39257,40431,40257,40372,40258,40382,39299}, -- 德鲁伊
+}
+
+-- ---- [tier] 受管模板 entry ----
+-- 本模块自带强度档位模板：190090 入门 / 190091 标准 / 190092 困难 / 190093 团本。
+-- 这些 entry 一律注册 creature 事件，保证面板切档后旧档位残留的 Boss 仍可被清理与结算。
+local BOSS_TIER_ENTRIES = {190090, 190091, 190092, 190093}
+
+-- ============================================================================
+--  配置分组元数据（供 `.boss config show` 展示，与描述表的 group 字段一一对应）
+-- ============================================================================
+local BOSS_CONFIG_GROUPS = {
+    identity = "Boss 身份",
+    basic = "基础属性",
+    ally = "友方援军",
+    yells = "喊话",
+    taunts = "战斗嘲讽",
+    ai = "AI 节奏",
+    phase = "战斗阶段",
+    patrol = "巡逻",
+    minion = "小怪与援军",
+    skill = "技能池",
+    respawn = "刷新间隔",
+    spawnpoints = "刷新点",
+    helper = "援军模板",
+    reward = "奖励",
+    class = "职业",
+    tier = "受管模板",
+}
+
+local BOSS_CONFIG_GROUP_ORDER = {
+    "identity", "basic", "ally", "yells", "taunts", "ai", "phase", "patrol", "minion",
+    "skill", "respawn", "spawnpoints", "helper", "reward", "class", "tier",
+}
+
+-- ============================================================================
+--  配置项 → 数据库列 描述表（配置与数据库之间唯一的映射来源）
+-- ----------------------------------------------------------------------------
+--  字段说明：
+--    group  分组（BOSS_CONFIG_GROUPS 的键）
+--    column 数据库列名
+--    kind   取值类型，决定序列化/解析方式：
+--             int           整数
+--             bool          0/1 布尔
+--             scaled        小数（库内 ×BOSS_DECIMAL_SCALE 存 INT）
+--             text          文本，允许为空（空 = 关闭该喊话）
+--             text_keep     文本，空字符串视为「未配置」→ 保留当前值
+--             intlist       正整数列表 "1,2,3"
+--             lines         多行文本 ↔ 字符串数组（一行一条）
+--             keyedlines    多行 "键=值" ↔ 字符串映射
+--             keyedword     同 keyedlines（值为短标识，如职业类型）
+--             keyedintlist  多行 "键=1,2,3" ↔ 数组映射
+--             spawnpoints   多行 "mapId,x,y,z" ↔ 坐标数组
+--    target 运行期配置容器名（见下面的 CONFIG_TARGETS）
+--    key    容器内的字段名；整表容器（列表类）留空
+--    min/max 数值边界（int/scaled 用；与旧版手写 clamp 完全一致）
+--    ddl    ext 表的列定义（主表列定义见 §4 的 CREATE TABLE，不能随意改）
+--    keepDefaultWhenEmpty  列表/映射解析为空时保留文件内默认值
+-- ============================================================================
+
+-- 主表：与 AGMP 面板共享的列。列顺序必须与建表语句/旧版 INSERT 一致，
+-- 面板读写在 AGMP 的 BossRepository.php：读取只 SELECT 自己认识的列，
+-- 保存用 REPLACE INTO 整行重写——所以面板不认识的列不要加在主表上（放 ext 表）。
+local BOSS_CONFIG_SCHEMA_MAIN = {
+    -- identity
+    { group = "identity", column = "boss_entry", kind = "int", min = 1, max = 2000000,
+      target = "BOSS_CANDIDATES", key = "entry" },
+    { group = "identity", column = "boss_name", kind = "text_keep",
+      target = "BOSS_CANDIDATES", key = "name" },
+    -- basic
+    { group = "basic", column = "boss_level", kind = "int", min = 1, max = 255,
+      target = "BOSS_CONFIG", key = "bossLevel" },
+    { group = "basic", column = "boss_scale_scaled", kind = "scaled", min = 10, max = 5000,
+      target = "BOSS_CONFIG", key = "bossScale" },
+    { group = "basic", column = "boss_health_multiplier_scaled", kind = "scaled", min = 10, max = 200000,
+      target = "BOSS_CONFIG", key = "bossHealthMultiplier" },
+    { group = "basic", column = "boss_auras_text", kind = "intlist",
+      target = "BOSS_CONFIG", key = "bossAuras" },
+    -- ally
+    { group = "ally", column = "ally_level", kind = "int", min = 1, max = 255,
+      target = "BOSS_CONFIG", key = "allyLevel" },
+    { group = "ally", column = "ally_health_multiplier_scaled", kind = "scaled", min = 10, max = 200000,
+      target = "BOSS_CONFIG", key = "allyHealthMultiplier" },
+    -- respawn
+    { group = "respawn", column = "respawn_time_minutes", kind = "int", min = 1, max = 1440,
+      target = "BOSS_CONFIG", key = "respawnTimeMinutes" },
+    -- minion
+    { group = "minion", column = "minion_count_min", kind = "int", min = 0, max = 20,
+      target = "BOSS_CONFIG", key = "minionCountMin" },
+    { group = "minion", column = "minion_count_max", kind = "int", min = 0, max = 20,
+      target = "BOSS_CONFIG", key = "minionCountMax" },
+    -- skill
+    { group = "skill", column = "skill_preset", kind = "text_keep",
+      target = "BOSS_CONFIG", key = "skillPreset" },
+    { group = "skill", column = "skill_difficulty", kind = "text_keep",
+      target = "BOSS_CONFIG", key = "skillDifficulty" },
+    -- reward
+    { group = "reward", column = "guaranteed_reward_enabled", kind = "bool",
+      target = "REWARD_PROBABILITIES", key = "guaranteedRewardEnabled" },
+    { group = "reward", column = "guaranteed_reward_notify", kind = "bool",
+      target = "REWARD_PROBABILITIES", key = "guaranteedRewardNotify" },
+    { group = "reward", column = "max_random_reward_players", kind = "int", min = 0, max = 100,
+      target = "REWARD_PROBABILITIES", key = "maxRandomRewardPlayers" },
+    { group = "reward", column = "class_reward_chance", kind = "int", min = 0, max = 100,
+      target = "REWARD_PROBABILITIES", key = "classRewardChance" },
+    { group = "reward", column = "formula_reward_chance", kind = "int", min = 0, max = 100,
+      target = "REWARD_PROBABILITIES", key = "formulaRewardChance" },
+    { group = "reward", column = "mount_reward_chance", kind = "int", min = 0, max = 100,
+      target = "REWARD_PROBABILITIES", key = "mountRewardChance" },
+    { group = "reward", column = "random_reward_mode", kind = "text_keep",
+      target = "REWARD_PROBABILITIES", key = "randomRewardMode" },
+    { group = "reward", column = "participation_range", kind = "int", min = 20, max = 500,
+      target = "REWARD_PROBABILITIES", key = "participationRange" },
+    { group = "reward", column = "damage_weight", kind = "int", min = 0, max = 10000,
+      target = "REWARD_PROBABILITIES", key = "damageWeight" },
+    { group = "reward", column = "healing_weight", kind = "int", min = 0, max = 10000,
+      target = "REWARD_PROBABILITIES", key = "healingWeight" },
+    { group = "reward", column = "threat_weight", kind = "int", min = 0, max = 10000,
+      target = "REWARD_PROBABILITIES", key = "threatWeight" },
+    { group = "reward", column = "presence_weight", kind = "int", min = 0, max = 10000,
+      target = "REWARD_PROBABILITIES", key = "presenceWeight" },
+    { group = "reward", column = "kill_weight", kind = "int", min = 0, max = 10000,
+      target = "REWARD_PROBABILITIES", key = "killWeight" },
+    { group = "reward", column = "guaranteed_item_id", kind = "int", min = 0, max = 2000000,
+      target = "REWARD_GUARANTEED", key = "itemId" },
+    { group = "reward", column = "guaranteed_item_count", kind = "int", min = 0, max = 10000,
+      target = "REWARD_GUARANTEED", key = "count" },
+    { group = "reward", column = "gold_min_copper", kind = "int", min = 0, max = 2000000000,
+      target = "REWARD_GOLD", key = "minCopper" },
+    { group = "reward", column = "gold_max_copper", kind = "int", min = 0, max = 2000000000,
+      target = "REWARD_GOLD", key = "maxCopper" },
+    { group = "reward", column = "reward_items_text", kind = "intlist",
+      target = "REWARD_ITEMS" },
+    { group = "reward", column = "reward_formulas_text", kind = "intlist",
+      target = "REWARD_FORMULAS" },
+    { group = "reward", column = "reward_mounts_text", kind = "intlist",
+      target = "REWARD_MOUNTS" },
+    -- spawnpoints
+    { group = "spawnpoints", column = "spawn_points_text", kind = "spawnpoints",
+      target = "SPAWN_POINTS" },
+}
+
+-- 扩展表：脚本私有配置。面板（「扩展配置」Tab）会 upsert 这些列，但列定义仍以本表为准：
+-- 加配置 = 在默认值区加一个字段 + 在这里加一行（建表语句、补列、读写会自动跟着变），
+-- 面板侧再加同样的列/文案即可编辑（见 AGMP config/boss.php 的 ext_fields）。
+local BOSS_CONFIG_SCHEMA_EXT = {
+    -- yells
+    { group = "yells", column = "boss_spawn_yell", kind = "text", ddl = "VARCHAR(255) NOT NULL DEFAULT ''",
+      target = "BOSS_CONFIG", key = "bossSpawnYell" },
+    { group = "yells", column = "boss_enter_combat_yell", kind = "text", ddl = "VARCHAR(255) NOT NULL DEFAULT ''",
+      target = "BOSS_CONFIG", key = "bossEnterCombatYell" },
+    { group = "yells", column = "ally_spawn_yell", kind = "text", ddl = "VARCHAR(255) NOT NULL DEFAULT ''",
+      target = "BOSS_CONFIG", key = "allySpawnYell" },
+    { group = "yells", column = "boss_respawn_yell", kind = "text", ddl = "VARCHAR(255) NOT NULL DEFAULT ''",
+      target = "BOSS_CONFIG", key = "bossRespawnYell" },
+    { group = "yells", column = "boss_gm_spawn_yell", kind = "text", ddl = "VARCHAR(255) NOT NULL DEFAULT ''",
+      target = "BOSS_CONFIG", key = "bossGMSpawnYell" },
+    -- taunts
+    { group = "taunts", column = "taunt_cooldown_seconds", kind = "int", min = 1, max = 3600,
+      ddl = "INT NOT NULL DEFAULT 8", target = "BOSS_CONFIG", key = "tauntCooldown" },
+    { group = "taunts", column = "random_taunt_chance", kind = "int", min = 0, max = 100,
+      ddl = "INT NOT NULL DEFAULT 15", target = "BOSS_CONFIG", key = "randomTauntChance" },
+    { group = "taunts", column = "taunt_phase2_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "phase2Yells" },
+    { group = "taunts", column = "taunt_phase3_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "phase3Yells" },
+    { group = "taunts", column = "taunt_critical_hp_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "criticalHpYells" },
+    { group = "taunts", column = "taunt_skill_cast_yells_text", kind = "keyedlines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "skillCastYells" },
+    { group = "taunts", column = "taunt_target_switch_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "targetSwitchYells" },
+    { group = "taunts", column = "taunt_interrupt_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "interruptYells" },
+    { group = "taunts", column = "taunt_kill_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "killYells" },
+    { group = "taunts", column = "taunt_low_hp_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "lowHpYells" },
+    { group = "taunts", column = "taunt_healer_kill_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "healerKillYells" },
+    { group = "taunts", column = "taunt_summon_minion_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "summonMinionYells" },
+    { group = "taunts", column = "taunt_combo_yells_text", kind = "keyedlines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "comboYells" },
+    { group = "taunts", column = "taunt_long_combat_yells_text", kind = "lines", ddl = "TEXT NULL",
+      target = "TAUNTS", key = "longCombatYells" },
+    -- ai
+    { group = "ai", column = "ai_update_interval_ms", kind = "int", min = 200, max = 60000,
+      ddl = "INT NOT NULL DEFAULT 1500", target = "BOSS_CONFIG", key = "aiUpdateInterval" },
+    -- phase
+    { group = "phase", column = "phase2_hp_threshold", kind = "int", min = 1, max = 99,
+      ddl = "INT NOT NULL DEFAULT 70", target = "BOSS_CONFIG", key = "phase2HpThreshold" },
+    { group = "phase", column = "phase3_hp_threshold", kind = "int", min = 1, max = 99,
+      ddl = "INT NOT NULL DEFAULT 20", target = "BOSS_CONFIG", key = "phase3HpThreshold" },
+    { group = "phase", column = "critical_hp_threshold", kind = "int", min = 1, max = 99,
+      ddl = "INT NOT NULL DEFAULT 10", target = "BOSS_CONFIG", key = "criticalHpThreshold" },
+    { group = "phase", column = "low_hp_taunt_threshold", kind = "int", min = 1, max = 100,
+      ddl = "INT NOT NULL DEFAULT 30", target = "BOSS_CONFIG", key = "lowHpTauntThreshold" },
+    { group = "phase", column = "low_hp_taunt_cooldown_ms", kind = "int", min = 1000, max = 600000,
+      ddl = "INT NOT NULL DEFAULT 20000", target = "BOSS_CONFIG", key = "lowHpTauntCooldownMs" },
+    { group = "phase", column = "long_combat_taunt_interval_ms", kind = "int", min = 5000, max = 3600000,
+      ddl = "INT NOT NULL DEFAULT 60000", target = "BOSS_CONFIG", key = "longCombatTauntIntervalMs" },
+    { group = "phase", column = "target_reeval_loops", kind = "int", min = 1, max = 100,
+      ddl = "INT NOT NULL DEFAULT 3", target = "BOSS_CONFIG", key = "targetReevalLoops" },
+    { group = "phase", column = "phase2_summon_count_min", kind = "int", min = 0, max = 20,
+      ddl = "INT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "phase2SummonCountMin" },
+    { group = "phase", column = "phase2_summon_count_max", kind = "int", min = 0, max = 20,
+      ddl = "INT NOT NULL DEFAULT 2", target = "BOSS_CONFIG", key = "phase2SummonCountMax" },
+    { group = "phase", column = "phase3_summon_count", kind = "int", min = 0, max = 20,
+      ddl = "INT NOT NULL DEFAULT 2", target = "BOSS_CONFIG", key = "phase3SummonCount" },
+    { group = "phase", column = "phase2_spell_id", kind = "int", min = 0, max = 2000000,
+      ddl = "INT NOT NULL DEFAULT 1044", target = "BOSS_CONFIG", key = "phase2SpellId" },
+    { group = "phase", column = "phase3_spell_id", kind = "int", min = 0, max = 2000000,
+      ddl = "INT NOT NULL DEFAULT 8599", target = "BOSS_CONFIG", key = "phase3SpellId" },
+    -- patrol
+    { group = "patrol", column = "patrol_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "patrolEnabled" },
+    { group = "patrol", column = "patrol_radius", kind = "int", min = 0, max = 1000,
+      ddl = "INT NOT NULL DEFAULT 50", target = "BOSS_CONFIG", key = "patrolRadius" },
+    { group = "patrol", column = "patrol_leash_radius", kind = "int", min = 0, max = 2000,
+      ddl = "INT NOT NULL DEFAULT 100", target = "BOSS_CONFIG", key = "patrolLeashRadius" },
+    { group = "patrol", column = "patrol_interval_ms", kind = "int", min = 500, max = 3600000,
+      ddl = "INT NOT NULL DEFAULT 9000", target = "BOSS_CONFIG", key = "patrolInterval" },
+    -- minion
+    { group = "minion", column = "minion_ai_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "minionAiEnabled" },
+    { group = "minion", column = "minion_ai_interval_ms", kind = "int", min = 200, max = 60000,
+      ddl = "INT NOT NULL DEFAULT 1800", target = "BOSS_CONFIG", key = "minionAiInterval" },
+    { group = "minion", column = "minion_target_range", kind = "int", min = 1, max = 200,
+      ddl = "INT NOT NULL DEFAULT 40", target = "BOSS_CONFIG", key = "minionTargetRange" },
+    -- helper
+    { group = "helper", column = "helper_entries_text", kind = "intlist", keepDefaultWhenEmpty = true,
+      ddl = "VARCHAR(255) NOT NULL DEFAULT ''", target = "HELPER_ENTRIES" },
+    { group = "helper", column = "ally_helper_entry", kind = "int", min = 1, max = 2000000,
+      ddl = "INT NOT NULL DEFAULT 20977", target = "ALLY_HELPER_ENTRY" },
+    -- class
+    { group = "class", column = "class_types_text", kind = "keyedword", keepDefaultWhenEmpty = true,
+      ddl = "TEXT NULL", target = "CLASS_TYPES" },
+    { group = "class", column = "class_reward_items_text", kind = "keyedintlist", keepDefaultWhenEmpty = true,
+      ddl = "TEXT NULL", target = "CLASS_REWARD_ITEMS" },
+    -- tier
+    { group = "tier", column = "managed_tier_entries_text", kind = "intlist", keepDefaultWhenEmpty = true,
+      ddl = "VARCHAR(255) NOT NULL DEFAULT ''", target = "BOSS_TIER_ENTRIES" },
+}
+
+-- ============================================================================
+--  配置目标注册表：描述表的 target/key 通过这里落到具体的 Lua 表/变量
+--  （SPAWN_POINTS / REWARD_ITEMS 这类整表配置用 get/set 闭包整体替换）
+-- ============================================================================
+local CONFIG_TARGETS = {}
+
+local function RegisterConfigTarget(name, getter, setter)
+    CONFIG_TARGETS[name] = { get = getter, set = setter }
+end
+
+RegisterConfigTarget("BOSS_CANDIDATES",
+    function(key) return BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1][key] end,
+    function(key, value)
+        if not BOSS_CANDIDATES[1] then BOSS_CANDIDATES[1] = {} end
+        BOSS_CANDIDATES[1][key] = value
+    end)
+
+RegisterConfigTarget("BOSS_CONFIG",
+    function(key) return BOSS_CONFIG[key] end,
+    function(key, value) BOSS_CONFIG[key] = value end)
+
+RegisterConfigTarget("TAUNTS",
+    function(key) return BOSS_CONFIG.combatTaunts[key] end,
+    function(key, value) BOSS_CONFIG.combatTaunts[key] = value end)
+
+RegisterConfigTarget("REWARD_PROBABILITIES",
+    function(key) return REWARD_PROBABILITIES[key] end,
+    function(key, value) REWARD_PROBABILITIES[key] = value end)
+
+RegisterConfigTarget("REWARD_GUARANTEED",
+    function(key) return REWARD_GUARANTEED[key] end,
+    function(key, value) REWARD_GUARANTEED[key] = value end)
+
+RegisterConfigTarget("REWARD_GOLD",
+    function(key) return REWARD_GOLD[key] end,
+    function(key, value) REWARD_GOLD[key] = value end)
+
+RegisterConfigTarget("REWARD_ITEMS",
+    function() return REWARD_ITEMS end,
+    function(_, value) REWARD_ITEMS = value end)
+
+RegisterConfigTarget("REWARD_FORMULAS",
+    function() return REWARD_FORMULAS end,
+    function(_, value) REWARD_FORMULAS = value end)
+
+RegisterConfigTarget("REWARD_MOUNTS",
+    function() return REWARD_MOUNTS end,
+    function(_, value) REWARD_MOUNTS = value end)
+
+RegisterConfigTarget("SPAWN_POINTS",
+    function() return SPAWN_POINTS end,
+    function(_, value) SPAWN_POINTS = value end)
+
+RegisterConfigTarget("HELPER_ENTRIES",
+    function() return HELPER_ENTRIES end,
+    function(_, value) HELPER_ENTRIES = value end)
+
+RegisterConfigTarget("ALLY_HELPER_ENTRY",
+    function() return ALLY_HELPER_ENTRY end,
+    function(_, value) ALLY_HELPER_ENTRY = value end)
+
+RegisterConfigTarget("CLASS_TYPES",
+    function() return CLASS_TYPES end,
+    function(_, value) CLASS_TYPES = value end)
+
+RegisterConfigTarget("CLASS_REWARD_ITEMS",
+    function() return CLASS_REWARD_ITEMS end,
+    function(_, value) CLASS_REWARD_ITEMS = value end)
+
+RegisterConfigTarget("BOSS_TIER_ENTRIES",
+    function() return BOSS_TIER_ENTRIES end,
+    function(_, value) BOSS_TIER_ENTRIES = value end)
+
+local function GetConfigTargetValue(descriptor)
+    local target = CONFIG_TARGETS[descriptor.target]
+    if not target then
+        return nil
+    end
+
+    return target.get(descriptor.key)
+end
+
+local function SetConfigTargetValue(descriptor, value)
+    local target = CONFIG_TARGETS[descriptor.target]
+    if not target then
+        return false
+    end
+
+    target.set(descriptor.key, value)
+    return true
+end
+
+-- ============================================================================
+--  配置区结束（§4 起为表结构自举与读写实现，正常调参不需要看下面）
+-- ============================================================================
 
 local function BossSchemaColumnExists(tableName, columnName)
     local query = CharDBQuery(
@@ -329,13 +888,71 @@ local function EnsureBossSchemaColumn(tableName, columnName, columnDefinition)
     )
 end
 
+-- ============================================================================
+--  §4 数据库表结构自举（ac_eluna）
+-- ----------------------------------------------------------------------------
+--  主表/运行态/事件/贡献表的列是「对外契约」（AGMP 面板按列名读写），列定义写死；
+--  配置扩展表的列由 BOSS_CONFIG_SCHEMA_EXT 生成，加配置项不需要改这里。
+-- ============================================================================
+
+-- 配置扩展表的建表语句：列完全来自描述表，避免「描述表加了字段、建表语句忘了加」。
+local function BuildBossExtTableSql()
+    local columns = {
+        '`state_key` VARCHAR(32) NOT NULL',
+    }
+
+    for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_EXT) do
+        columns[#columns + 1] = '`' .. descriptor.column .. '` ' .. (descriptor.ddl or 'TEXT NULL')
+    end
+
+    columns[#columns + 1] = '`updated_at` INT NOT NULL DEFAULT 0'
+    columns[#columns + 1] = 'PRIMARY KEY (`state_key`)'
+
+    return 'CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_EXT_TABLE .. '` ('
+        .. table.concat(columns, ',')
+        .. ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;'
+end
+
+-- 扩展表已存在、但描述表新增了列时必须补列：
+-- CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做，缺列会让引导写入整条失败
+-- （表现为面板/脚本改完配置却始终不生效）。
+-- 常见情况下（列齐全）只多一条 COUNT 查询；只有真缺列时才逐列 ALTER。
+local function EnsureBossExtTableColumns()
+    local columnNames = {}
+    for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_EXT) do
+        columnNames[#columnNames + 1] = "'" .. descriptor.column .. "'"
+    end
+
+    if #columnNames == 0 then
+        return
+    end
+
+    local countQuery = CharDBQuery(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '"
+            .. BOSS_DB_NAME
+            .. "' AND TABLE_NAME = '"
+            .. BOSS_EXT_TABLE
+            .. "' AND COLUMN_NAME IN ("
+            .. table.concat(columnNames, ",")
+            .. ");"
+    )
+
+    if countQuery ~= nil and countQuery:GetUInt32(0) >= #BOSS_CONFIG_SCHEMA_EXT then
+        return
+    end
+
+    for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_EXT) do
+        EnsureBossSchemaColumn(BOSS_EXT_TABLE, descriptor.column, descriptor.ddl or 'TEXT NULL')
+    end
+end
+
 local function EnsureBossSchema(force)
     if BOSS_SCHEMA_READY and not force then
         return true
     end
 
     CharDBQuery('CREATE DATABASE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`;')
-    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`boss_activity_runtime` ('
+    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_RUNTIME_TABLE .. '` ('
         .. '`state_key` VARCHAR(32) NOT NULL,'
         .. '`boss_guid` INT NOT NULL DEFAULT 0,'
         .. '`boss_entry` INT NOT NULL DEFAULT 0,'
@@ -356,7 +973,7 @@ local function EnsureBossSchema(force)
         .. '`last_reset_at` INT NOT NULL DEFAULT 0,'
         .. '`updated_at` INT NOT NULL DEFAULT 0,'
         .. 'PRIMARY KEY (`state_key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
-    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`boss_activity_events` ('
+    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_EVENT_TABLE .. '` ('
         .. '`id` INT NOT NULL AUTO_INCREMENT,'
         .. '`boss_guid` INT NOT NULL DEFAULT 0,'
         .. '`boss_entry` INT NOT NULL DEFAULT 0,'
@@ -370,7 +987,7 @@ local function EnsureBossSchema(force)
         .. 'PRIMARY KEY (`id`),'
         .. 'KEY `idx_created_at` (`created_at`),'
         .. 'KEY `idx_event_type` (`event_type`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
-    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`boss_activity_contributors` ('
+    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_CONTRIBUTOR_TABLE .. '` ('
         .. '`id` INT NOT NULL AUTO_INCREMENT,'
         .. '`boss_guid` INT NOT NULL DEFAULT 0,'
         .. '`boss_entry` INT NOT NULL DEFAULT 0,'
@@ -390,7 +1007,7 @@ local function EnsureBossSchema(force)
         .. 'PRIMARY KEY (`id`),'
         .. 'KEY `idx_created_at` (`created_at`),'
         .. 'KEY `idx_player_guid` (`player_guid`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
-    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`boss_activity_config` ('
+    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_MAIN_TABLE .. '` ('
         .. '`state_key` VARCHAR(32) NOT NULL,'
         .. '`boss_entry` INT NOT NULL DEFAULT 190090,'
         .. '`boss_name` VARCHAR(120) NOT NULL DEFAULT "",'
@@ -429,20 +1046,25 @@ local function EnsureBossSchema(force)
         .. '`updated_at` INT NOT NULL DEFAULT 0,'
         .. 'PRIMARY KEY (`state_key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
 
+    -- 脚本私有配置表：列由 BOSS_CONFIG_SCHEMA_EXT 生成（新增配置项无需改这里），
+    -- 已存在的表缺列时由 EnsureBossExtTableColumns 补齐
+    CharDBQuery(BuildBossExtTableSql())
+    EnsureBossExtTableColumns()
+
     EnsureBossSchemaColumn(
-        'boss_activity_config',
+        BOSS_MAIN_TABLE,
         'spawn_points_text',
         'TEXT NULL AFTER `reward_mounts_text`'
     )
 
-    EnsureBossSchemaColumn('boss_activity_contributors', 'account_id', 'INT NOT NULL DEFAULT 0')
-    EnsureBossSchemaColumn('boss_activity_contributors', 'healing_done', 'BIGINT NOT NULL DEFAULT 0')
-    EnsureBossSchemaColumn('boss_activity_contributors', 'threat_samples', 'INT NOT NULL DEFAULT 0')
-    EnsureBossSchemaColumn('boss_activity_contributors', 'presence_samples', 'INT NOT NULL DEFAULT 0')
-    EnsureBossSchemaColumn('boss_activity_contributors', 'contribution_score', 'DOUBLE NOT NULL DEFAULT 0')
-    EnsureBossSchemaColumn('boss_activity_contributors', 'was_killer', 'TINYINT NOT NULL DEFAULT 0')
-    EnsureBossSchemaColumn('boss_activity_contributors', 'rewarded_random', 'TINYINT NOT NULL DEFAULT 0')
-    EnsureBossSchemaColumn('boss_activity_contributors', 'guaranteed_reward', 'TINYINT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'account_id', 'INT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'healing_done', 'BIGINT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'threat_samples', 'INT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'presence_samples', 'INT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'contribution_score', 'DOUBLE NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'was_killer', 'TINYINT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'rewarded_random', 'TINYINT NOT NULL DEFAULT 0')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'guaranteed_reward', 'TINYINT NOT NULL DEFAULT 0')
 
     BOSS_SCHEMA_READY = true
     return true
@@ -450,20 +1072,16 @@ end
 
 EnsureBossSchema(true)
 
--- ========== Boss相关配置 ==========
--- 活动 Boss 模板（默认项；启动时会以 ac_eluna.boss_activity_config 中的配置覆盖）
-local BOSS_CANDIDATES = {
-    {entry = 190090, name = "送财童子"},
-    --{entry = 507, name = "傻子2"},
-    --{entry = 7342, name = "傻子3"},
-}
-
--- 本模块自带的强度档位模板（AGMP 面板「难度档位」下拉框对应的 entry）：
---   190090 入门 / 190091 标准 / 190092 困难 / 190093 团本
--- 这些 entry 一律注册 creature 事件，保证面板切档后旧档位残留的 Boss 仍可被清理与结算。
-local BOSS_TIER_ENTRIES = {190090, 190091, 190092, 190093}
-
-local BOSS_ENTRY = 190090
+-- ============================================================================
+--  §5 内容库（非配置项）
+-- ----------------------------------------------------------------------------
+--  下面这些是「技能内容」而不是「可调配置」：
+--    * 技能池预设 / 强度档位：每个技能由 spellId + 冷却 + 目标 + 条件构成，
+--      改动等于改战斗设计，需要走版本发布与复核，不适合在数据库里改；
+--    * 打断法术池：核心打断技能清单。
+--  可调的部分（选哪套预设、哪个强度档位）已经落库：见 [skill] 的
+--  boss_activity_config.skill_preset / skill_difficulty。
+-- ============================================================================
 
 -- ========== 技能池预设（基于 Northrend 脚本） ==========
 -- 技能参数说明：
@@ -760,6 +1378,18 @@ local ACTIVE_SKILL_PRESET = nil
 local ACTIVE_SKILL_DIFFICULTY_KEY = nil
 local ACTIVE_SKILL_DIFFICULTY = nil
 
+-- ============================================================================
+--  §6 序列化与 SQL 工具
+-- ----------------------------------------------------------------------------
+--  文本 ↔ 运行期结构的转换集中在这里，配置描述表的每种 kind 都对应下面一组函数：
+--    intlist     "1,2,3"          ↔ 正整数数组        Parse/SerializePositiveIntegerList
+--    lines       每行一条          ↔ 字符串数组        Parse/SerializeLineList
+--    keyedlines  每行 "键=值"      ↔ 字符串映射        Parse/SerializeKeyedLines
+--    keyedword   同 keyedlines     ↔ 短标识映射（职业类型）
+--    keyedintlist 每行 "键=1,2,3"  ↔ 数组映射          Parse/SerializeKeyedIntegerLists
+--    spawnpoints 每行 "map,x,y,z"  ↔ 坐标数组          Parse/SerializeSpawnPoints
+-- ============================================================================
+
 local function ClampNumber(value, minValue, maxValue)
     return math.max(minValue, math.min(maxValue, value))
 end
@@ -819,6 +1449,118 @@ local function SerializePositiveIntegerList(values)
     return table.concat(parts, ",")
 end
 
+-- 多行文本 ↔ 字符串数组（喊话/嘲讽列表：一行一条）。
+-- 空行不会变成空喊话；含 = 号的行对 lines 无影响，对 keyedlines 按第一个 = 切分。
+local function ParseLineList(text)
+    local lines = {}
+    for line in string.gmatch(tostring(text or "") .. "\n", "([^\r\n]*)[\r\n]") do
+        if line ~= "" then
+            table.insert(lines, line)
+        end
+    end
+
+    return lines
+end
+
+-- 单行文本（喊话原文可能带前导空格，不能 trim）
+local function SanitizeSingleLine(value)
+    local text = tostring(value or "")
+    text = text:gsub("[\r\n]+", " ")
+    return text
+end
+
+local function SerializeLineList(values)
+    local lines = {}
+    if type(values) ~= "table" then
+        return ""
+    end
+
+    for _, value in ipairs(values) do
+        local text = SanitizeSingleLine(value)
+        if text ~= "" then
+            table.insert(lines, text)
+        end
+    end
+
+    return table.concat(lines, "\n")
+end
+
+local function ParseKeyedLines(text)
+    local map = {}
+    for _, line in ipairs(ParseLineList(text)) do
+        local key, value = line:match("^([^=]+)=(.*)$")
+        if key then
+            key = key:gsub("^%s+", ""):gsub("%s+$", "")
+            if key ~= "" and value ~= "" then
+                map[key] = value
+            end
+        end
+    end
+
+    return map
+end
+
+-- 键排序后输出：同样的配置生成同样的文本，便于 DBA 肉眼比对与 diff
+-- 注意：键要按「原值」回查 map（数值键 1 与字符串键 "1" 在 Lua 里不同），
+-- 否则 map["1"] 取不到 map[1]，会写出 "1=" 这种空值。
+local function SerializeKeyedLines(map)
+    if type(map) ~= "table" then
+        return ""
+    end
+
+    local keys = {}
+    for key, value in pairs(map) do
+        if type(value) == "string" and value ~= "" then
+            table.insert(keys, key)
+        end
+    end
+    table.sort(keys, function(left, right) return tostring(left) < tostring(right) end)
+
+    local lines = {}
+    for _, key in ipairs(keys) do
+        lines[#lines + 1] = SanitizeSingleLine(key) .. "=" .. SanitizeSingleLine(map[key])
+    end
+
+    return table.concat(lines, "\n")
+end
+
+local function ParseKeyedIntegerLists(text)
+    local map = {}
+    for key, value in pairs(ParseKeyedLines(text)) do
+        local numericKey = tonumber(key)
+        if numericKey then
+            local list = ParsePositiveIntegerList(value)
+            if #list > 0 then
+                map[numericKey] = list
+            end
+        end
+    end
+
+    return map
+end
+
+local function SerializeKeyedIntegerLists(map)
+    if type(map) ~= "table" then
+        return ""
+    end
+
+    local keys = {}
+    for key, value in pairs(map) do
+        local numericKey = tonumber(key)
+        if numericKey and type(value) == "table" and SerializePositiveIntegerList(value) ~= "" then
+            table.insert(keys, numericKey)
+        end
+    end
+    table.sort(keys)
+
+    local lines = {}
+    for _, key in ipairs(keys) do
+        lines[#lines + 1] = tostring(key) .. "=" .. SerializePositiveIntegerList(map[key])
+    end
+
+    return table.concat(lines, "\n")
+end
+
 local function SerializeSpawnPoints(points)
     local rows = {}
     if type(points) ~= "table" then
@@ -868,21 +1610,8 @@ local function ParseSpawnPointsText(text, fallbackPoints)
     end
 
     if #parsed == 0 then
-        local fallback = fallbackPoints or DEFAULT_SPAWN_POINTS
-        local cloned = {}
-        if type(fallback) == "table" then
-            for _, point in ipairs(fallback) do
-                if type(point) == "table" then
-                    table.insert(cloned, {
-                        mapId = tonumber(point.mapId) or 0,
-                        x = tonumber(point.x) or 0,
-                        y = tonumber(point.y) or 0,
-                        z = tonumber(point.z) or 0,
-                    })
-                end
-            end
-        end
-        return cloned
+        -- 文本里没有有效坐标（例如面板把该列清空了）→ 回退到文件内的默认刷新点
+        return CloneSpawnPoints(fallbackPoints or DEFAULT_SPAWN_POINTS)
     end
 
     return parsed
@@ -1038,124 +1767,6 @@ local function GetCurrentSkillDifficultyLabel()
     return ACTIVE_SKILL_DIFFICULTY_KEY .. "(" .. ACTIVE_SKILL_DIFFICULTY.displayName .. ")"
 end
 
--- ========== 刷新点配置 ==========
--- Boss重生时随机选择的坐标点
--- mapId: 地图ID（0=东部王国, 1=卡利姆多）
--- x, y, z: 坐标位置
-
-local SPAWN_POINTS = {
-    {mapId = 571, x = 4353.573, y = -4411.8877, z = 151.3909},  -- 灰熊丘陵月溪旅营地西南
-    {mapId = 571, x = 1246.5499, y = -4311.5073, z = 144.944},  -- 嚎风峡湾乌堡西
-    {mapId = 571, x = 8093.9595, y = 2827.9702, z = 553.28033},  -- 冰冠冰川哭泣采掘场
-	{mapId = 571, x = 6689.081, y = 500.4722, z = 401.2109},  -- 冰冠冰川天灾城
-	{mapId = 571, x = 2975.7952, y = 5373.769, z = 62.121082},  -- 北风苔原
-	{mapId = 571, x = 6005.9688, y = 5612.9023, z = -71.26319},  -- 索拉查盆地生命守卫者之路
-	{mapId = 571, x = 8355.781, y = -44.54596, z = 815.31604},  -- 风暴峭壁雪流平原
-}
-
-local function CloneSpawnPoints(points)
-    local cloned = {}
-    if type(points) ~= "table" then
-        return cloned
-    end
-
-    for _, point in ipairs(points) do
-        if type(point) == "table" then
-            table.insert(cloned, {
-                mapId = tonumber(point.mapId) or 0,
-                x = tonumber(point.x) or 0,
-                y = tonumber(point.y) or 0,
-                z = tonumber(point.z) or 0,
-            })
-        end
-    end
-
-    return cloned
-end
-
-DEFAULT_SPAWN_POINTS = CloneSpawnPoints(SPAWN_POINTS)
-
--- ========== 援军配置 ==========
--- HELPER_ENTRIES: Boss进入战斗时召唤的敌方援军（小怪）
--- 从creature_template.entry中选取
-
-local HELPER_ENTRIES = {16244, 15976, 16018, 16165}
-
--- ALLY_HELPER_ENTRY: 友方援军（帮助玩家攻击Boss）
--- 20977 = 米尔豪斯·法力风暴
-local ALLY_HELPER_ENTRY = 20977
-
--- ========== 奖励配置 ==========
--- 所有概率值为0-100的整数，表示百分比
-
-local REWARD_PROBABILITIES = {
-    classRewardChance = 60,    -- 职业专属装备奖励概率（%）
-    formulaRewardChance = 10,  -- 公式奖励概率（%）
-    mountRewardChance = 15,    -- 坐骑奖励概率（%）
-    
-    -- 【保底奖励配置】
-    -- 所有参与战斗的玩家均可获得（不限制人数）
-    guaranteedRewardEnabled = true,      -- 是否启用保底奖励
-    guaranteedRewardNotify = true,       -- 是否发送获得通知
-    
-    -- 【随机奖励人数配置】
-    maxRandomRewardPlayers = 3,          -- 最多多少名玩家可获得随机奖励（原奖励体系）
-    participationRange = 80,             -- 统计战斗贡献时使用的有效范围（码）
-    damageWeight = 100,                  -- 输出贡献权重
-    healingWeight = 80,                  -- 治疗贡献权重
-    threatWeight = 35,                   -- 承伤/仇恨存在感权重
-    presenceWeight = 10,                 -- 在场活跃权重（仅作微调，不单独决定资格）
-    killWeight = 3,                      -- 最后一击加权
-    randomRewardMode = "weighted",      -- weighted=按贡献加权；random=均匀随机
-    
-    -- 验证函数：确保概率值在0-100范围内
-    validate = function(self)
-        local function clamp(value)
-            return math.max(0, math.min(100, value))
-        end
-        self.classRewardChance = clamp(self.classRewardChance)
-        self.formulaRewardChance = clamp(self.formulaRewardChance)
-        self.mountRewardChance = clamp(self.mountRewardChance)
-        self.damageWeight = math.max(0, self.damageWeight or 0)
-        self.healingWeight = math.max(0, self.healingWeight or 0)
-        self.threatWeight = math.max(0, self.threatWeight or 0)
-        self.presenceWeight = math.max(0, self.presenceWeight or 0)
-        self.killWeight = math.max(0, self.killWeight or 0)
-        self.participationRange = math.max(20, self.participationRange or 80)
-        if self.randomRewardMode ~= "random" then
-            self.randomRewardMode = "weighted"
-        end
-        return self
-    end
-}
-REWARD_PROBABILITIES:validate()
-
--- 【奖励物品池】
--- REWARD_ITEMS: 必掉的（100%概率给一个）
-
-local REWARD_ITEMS = {38082, 41600, 51809, 34067}
-
--- REWARD_FORMULAS: 公式奖励（概率触发，见REWARD_PROBABILITIES.formulaRewardChance）
--- 45059=附魔公式  44491=附魔公式
-
-local REWARD_FORMULAS = {45059, 44491}
-
--- REWARD_MOUNTS: 稀有坐骑（概率触发，见REWARD_PROBABILITIES.mountRewardChance）
-
-local REWARD_MOUNTS = {32768,30480,13335,37719,49282,49290,19872,33977,33809,37828,43963,54068,33183,33189,35513,43964,19902,43963,46109,50250,49286,30609,54860,37012}
-
--- REWARD_GUARANTEED: 所有参与者的保底奖励配置
-local REWARD_GUARANTEED = {
-    itemId = 40753,
-    count = 2,
-}
-
--- REWARD_GOLD: 随机奖励获奖者的金币奖励配置（单位：铜）
-local REWARD_GOLD = {
-    minCopper = 30000,
-    maxCopper = 50000,
-}
-
 local function GetQueryString(query, columnIndex, fallbackValue)
     local success, value = pcall(function() return query:GetString(columnIndex) end)
     if success and value ~= nil then
@@ -1250,179 +1861,385 @@ local function BossSqlEscape(value, maxBytes)
     return text
 end
 
-local function PersistBossConfigToDB(insertIgnore)
-    EnsureBossSchema()
-    REWARD_PROBABILITIES:validate()
+-- ============================================================================
+--  §7 配置读写（描述表驱动）
+-- ----------------------------------------------------------------------------
+--  §3 的 BOSS_CONFIG_SCHEMA_MAIN / _EXT 是列与运行期字段之间唯一的映射来源：
+--  这里不再手写列清单、占位符顺序与 clamp，加一个配置项只需要在 §3 加一行。
+--  实现细节收在 do...end 里，只对外暴露 4 个函数，避免主 chunk 局部变量过多
+--  （Lua 5.2 主 chunk 最多 200 个 local）。
+-- ============================================================================
+local LoadBossConfigFromDB, PersistBossConfigToDB, ShowBossConfigGroups, ShowBossConfigGroup
+do
+    -- ---------------------------------------------------------------- 取值与格式化
+    -- 每条描述表项在 SQL 里的取值：既用于写库，也用于 `.boss config show` 展示
+    local function ToSqlLiteral(descriptor, value)
+        local kind = descriptor.kind
 
-    local bossCandidate = BOSS_CANDIDATES[1] or {entry = 647, name = "活动Boss"}
-    local commandPrefix = insertIgnore and "INSERT IGNORE INTO" or "REPLACE INTO"
-    local sql = string.format(
-        "%s `%s`.`boss_activity_config` ("
-            .. "`state_key`, `boss_entry`, `boss_name`, `boss_level`, `boss_scale_scaled`, `boss_health_multiplier_scaled`, "
-            .. "`boss_auras_text`, `ally_level`, `ally_health_multiplier_scaled`, `respawn_time_minutes`, `minion_count_min`, `minion_count_max`, "
-            .. "`skill_preset`, `skill_difficulty`, `guaranteed_reward_enabled`, `guaranteed_reward_notify`, `max_random_reward_players`, "
-            .. "`class_reward_chance`, `formula_reward_chance`, `mount_reward_chance`, `random_reward_mode`, `participation_range`, `damage_weight`, "
-            .. "`healing_weight`, `threat_weight`, `presence_weight`, `kill_weight`, `guaranteed_item_id`, `guaranteed_item_count`, `gold_min_copper`, "
-            .. "`gold_max_copper`, `reward_items_text`, `reward_formulas_text`, `reward_mounts_text`, `spawn_points_text`, `updated_at`) "
-            .. "VALUES ('%s', %d, '%s', %d, %d, %d, '%s', %d, %d, %d, %d, %d, '%s', '%s', %d, %d, %d, %d, %d, %d, '%s', %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, '%s', '%s', '%s', '%s', %d);",
-        commandPrefix,
-        BOSS_DB_NAME,
-        BOSS_CONFIG_KEY,
-        ClampInteger(bossCandidate.entry or 647, 1, 2000000),
-        BossSqlEscape(ResolveBossCandidateName(bossCandidate.entry, bossCandidate.name), 120),
-        ClampInteger(BOSS_CONFIG.bossLevel, 1, 255),
-        ClampInteger(RoundToScaledInteger(BOSS_CONFIG.bossScale), 10, 5000),
-        ClampInteger(RoundToScaledInteger(BOSS_CONFIG.bossHealthMultiplier), 10, 200000),
-        BossSqlEscape(SerializePositiveIntegerList(BOSS_CONFIG.bossAuras)),
-        ClampInteger(BOSS_CONFIG.allyLevel, 1, 255),
-        ClampInteger(RoundToScaledInteger(BOSS_CONFIG.allyHealthMultiplier), 10, 200000),
-        ClampInteger(BOSS_CONFIG.respawnTimeMinutes, 1, 1440),
-        ClampInteger(BOSS_CONFIG.minionCountMin, 0, 20),
-        ClampInteger(BOSS_CONFIG.minionCountMax, 0, 20),
-        BossSqlEscape(ACTIVE_SKILL_PRESET_KEY or BOSS_CONFIG.skillPreset or SKILL_PRESET_ORDER[1], 64),
-        BossSqlEscape(ACTIVE_SKILL_DIFFICULTY_KEY or BOSS_CONFIG.skillDifficulty or SKILL_DIFFICULTY_ORDER[2], 64),
-        REWARD_PROBABILITIES.guaranteedRewardEnabled and 1 or 0,
-        REWARD_PROBABILITIES.guaranteedRewardNotify and 1 or 0,
-        ClampInteger(REWARD_PROBABILITIES.maxRandomRewardPlayers, 0, 100),
-        ClampInteger(REWARD_PROBABILITIES.classRewardChance, 0, 100),
-        ClampInteger(REWARD_PROBABILITIES.formulaRewardChance, 0, 100),
-        ClampInteger(REWARD_PROBABILITIES.mountRewardChance, 0, 100),
-        BossSqlEscape(REWARD_PROBABILITIES.randomRewardMode or "weighted"),
-        ClampInteger(REWARD_PROBABILITIES.participationRange, 20, 500),
-        ClampInteger(REWARD_PROBABILITIES.damageWeight, 0, 10000),
-        ClampInteger(REWARD_PROBABILITIES.healingWeight, 0, 10000),
-        ClampInteger(REWARD_PROBABILITIES.threatWeight, 0, 10000),
-        ClampInteger(REWARD_PROBABILITIES.presenceWeight, 0, 10000),
-        ClampInteger(REWARD_PROBABILITIES.killWeight, 0, 10000),
-        ClampInteger(REWARD_GUARANTEED.itemId, 0, 2000000),
-        ClampInteger(REWARD_GUARANTEED.count, 0, 10000),
-        ClampInteger(REWARD_GOLD.minCopper, 0, 2000000000),
-        ClampInteger(REWARD_GOLD.maxCopper, 0, 2000000000),
-        BossSqlEscape(SerializePositiveIntegerList(REWARD_ITEMS)),
-        BossSqlEscape(SerializePositiveIntegerList(REWARD_FORMULAS)),
-        BossSqlEscape(SerializePositiveIntegerList(REWARD_MOUNTS)),
-        BossSqlEscape(SerializeSpawnPoints(SPAWN_POINTS)),
-        BossNow()
-    )
+        if kind == "int" then
+            return tostring(ClampInteger(value, descriptor.min, descriptor.max))
+        end
 
-    CharDBExecute(sql)
-end
+        if kind == "bool" then
+            return value and "1" or "0"
+        end
 
-local function LoadBossConfigFromDB()
-    EnsureBossSchema()
-    PersistBossConfigToDB(true)
+        if kind == "scaled" then
+            return tostring(ClampInteger(RoundToScaledInteger(value), descriptor.min, descriptor.max))
+        end
 
-    local query = CharDBQuery(string.format(
-        "SELECT `boss_entry`, `boss_name`, `boss_level`, `boss_scale_scaled`, `boss_health_multiplier_scaled`, `boss_auras_text`, "
-            .. "`ally_level`, `ally_health_multiplier_scaled`, `respawn_time_minutes`, `minion_count_min`, `minion_count_max`, `skill_preset`, `skill_difficulty`, "
-            .. "`guaranteed_reward_enabled`, `guaranteed_reward_notify`, `max_random_reward_players`, `class_reward_chance`, `formula_reward_chance`, `mount_reward_chance`, "
-            .. "`random_reward_mode`, `participation_range`, `damage_weight`, `healing_weight`, `threat_weight`, `presence_weight`, `kill_weight`, `guaranteed_item_id`, "
-            .. "`guaranteed_item_count`, `gold_min_copper`, `gold_max_copper`, `reward_items_text`, `reward_formulas_text`, `reward_mounts_text`, `spawn_points_text` "
-            .. "FROM `%s`.`boss_activity_config` WHERE `state_key` = '%s' LIMIT 1;",
-        BOSS_DB_NAME,
-        BOSS_CONFIG_KEY
-    ))
+        if kind == "intlist" then
+            return "'" .. BossSqlEscape(SerializePositiveIntegerList(value)) .. "'"
+        end
 
-    if query == nil then
-        print(" [配置]无法读取 boss_activity_config，继续使用当前内存配置。")
+        if kind == "lines" then
+            return "'" .. BossSqlEscape(SerializeLineList(value)) .. "'"
+        end
+
+        if kind == "keyedlines" or kind == "keyedword" then
+            return "'" .. BossSqlEscape(SerializeKeyedLines(value)) .. "'"
+        end
+
+        if kind == "keyedintlist" then
+            return "'" .. BossSqlEscape(SerializeKeyedIntegerLists(value)) .. "'"
+        end
+
+        if kind == "spawnpoints" then
+            return "'" .. BossSqlEscape(SerializeSpawnPoints(value)) .. "'"
+        end
+
+        -- text / text_keep
+        return "'" .. BossSqlEscape(value, 255) .. "'"
+    end
+
+    -- 该列在「列缺失/null」时的兜底文本（用于 GetQueryRawString 的 fallback）
+    local function FallbackText(descriptor, currentValue)
+        local kind = descriptor.kind
+
+        if kind == "intlist" then
+            return SerializePositiveIntegerList(currentValue)
+        end
+
+        if kind == "lines" then
+            return SerializeLineList(currentValue)
+        end
+
+        if kind == "keyedlines" or kind == "keyedword" then
+            return SerializeKeyedLines(currentValue)
+        end
+
+        if kind == "keyedintlist" then
+            return SerializeKeyedIntegerLists(currentValue)
+        end
+
+        if kind == "spawnpoints" then
+            -- 与旧版一致：该列为 NULL 时回退到「文件内的默认刷新点」
+            return SerializeSpawnPoints(DEFAULT_SPAWN_POINTS)
+        end
+
+        return tostring(currentValue or "")
+    end
+
+    -- 把一列的值解析成运行期结构；解析不出有效内容时按 keepDefaultWhenEmpty 决定
+    -- 是保留当前值（列表类）还是接受空值（喊话/嘲讽允许清空）。
+    local function ParseColumnValue(descriptor, query, columnIndex, currentValue)
+        local kind = descriptor.kind
+
+        if kind == "int" then
+            return ClampInteger(GetQueryUInt(query, columnIndex, currentValue or 0), descriptor.min, descriptor.max)
+        end
+
+        if kind == "scaled" then
+            local scaled = GetQueryInt(query, columnIndex, RoundToScaledInteger(currentValue))
+            return math.max(0.1, ScaledIntegerToNumber(scaled, currentValue))
+        end
+
+        if kind == "bool" then
+            return GetQueryUInt(query, columnIndex, currentValue and 1 or 0) == 1
+        end
+
+        if kind == "text_keep" then
+            -- 空字符串视为「未配置」，保留当前值（与旧版 GetQueryString 语义一致）
+            return GetQueryString(query, columnIndex, currentValue)
+        end
+
+        local rawText = GetQueryRawString(query, columnIndex, FallbackText(descriptor, currentValue))
+
+        if kind == "intlist" or kind == "spawnpoints" then
+            local list
+            if kind == "spawnpoints" then
+                list = ParseSpawnPointsText(rawText, DEFAULT_SPAWN_POINTS)
+            else
+                list = ParsePositiveIntegerList(rawText)
+            end
+            if #list == 0 and descriptor.keepDefaultWhenEmpty then
+                return currentValue
+            end
+            return list
+        end
+
+        local parsed
+        if kind == "lines" then
+            parsed = ParseLineList(rawText)
+        elseif kind == "keyedlines" or kind == "keyedword" then
+            parsed = ParseKeyedLines(rawText)
+        elseif kind == "keyedintlist" then
+            parsed = ParseKeyedIntegerLists(rawText)
+        else
+            return rawText
+        end
+
+        if next(parsed) == nil and descriptor.keepDefaultWhenEmpty then
+            return currentValue
+        end
+
+        return parsed
+    end
+
+    -- ---------------------------------------------------------------- SQL 构造
+    local function BuildBossSelectSql(tableName, descriptors)
+        -- 不带 state_key：WHERE 已经限定了行，取值下标与描述表顺序一一对应
+        local columns = {}
+        for _, descriptor in ipairs(descriptors) do
+            columns[#columns + 1] = '`' .. descriptor.column .. '`'
+        end
+
+        return string.format(
+            "SELECT %s FROM `%s`.`%s` WHERE `state_key` = '%s' LIMIT 1;",
+            table.concat(columns, ", "),
+            BOSS_DB_NAME,
+            tableName,
+            BOSS_CONFIG_KEY
+        )
+    end
+
+    local function BuildBossUpsertSql(tableName, descriptors, insertIgnore)
+        local columns = { '`state_key`' }
+        local values = { "'" .. BOSS_CONFIG_KEY .. "'" }
+        local updates = {}
+
+        for _, descriptor in ipairs(descriptors) do
+            columns[#columns + 1] = '`' .. descriptor.column .. '`'
+            values[#values + 1] = ToSqlLiteral(descriptor, GetConfigTargetValue(descriptor))
+            updates[#updates + 1] = '`' .. descriptor.column .. '`=VALUES(`' .. descriptor.column .. '`)'
+        end
+
+        columns[#columns + 1] = '`updated_at`'
+        values[#values + 1] = tostring(BossNow())
+        updates[#updates + 1] = '`updated_at`=VALUES(`updated_at`)'
+
+        local head = insertIgnore and "INSERT IGNORE INTO" or "INSERT INTO"
+        local sql = string.format(
+            "%s `%s`.`%s` (%s) VALUES (%s)",
+            head,
+            BOSS_DB_NAME,
+            tableName,
+            table.concat(columns, ", "),
+            table.concat(values, ", ")
+        )
+
+        if not insertIgnore then
+            -- 显式列出要更新的列：面板/其它工具写在同表上的列不会被顺手清掉
+            sql = sql .. " ON DUPLICATE KEY UPDATE " .. table.concat(updates, ", ")
+        end
+
+        return sql .. ";"
+    end
+
+    local function ApplyBossConfigQuery(descriptors, query)
+        for index, descriptor in ipairs(descriptors) do
+            local currentValue = GetConfigTargetValue(descriptor)
+            -- GetQuery*(query, columnIndex) 的下标从 0 开始
+            local parsed = ParseColumnValue(descriptor, query, index - 1, currentValue)
+            SetConfigTargetValue(descriptor, parsed)
+        end
+    end
+
+    -- 列之间的约束与技能池应用（与旧版手写逻辑一致）
+    local function FinalizeBossConfig()
+        BOSS_CONFIG.minionCountMax = math.max(BOSS_CONFIG.minionCountMin, BOSS_CONFIG.minionCountMax)
+        REWARD_GOLD.maxCopper = math.max(REWARD_GOLD.minCopper, REWARD_GOLD.maxCopper)
+
         REWARD_PROBABILITIES:validate()
+
         ApplySkillConfig(BOSS_CONFIG.skillPreset, BOSS_CONFIG.skillDifficulty)
-        return false
+        BOSS_CONFIG.skillPreset = ACTIVE_SKILL_PRESET_KEY or BOSS_CONFIG.skillPreset
+        BOSS_CONFIG.skillDifficulty = ACTIVE_SKILL_DIFFICULTY_KEY or BOSS_CONFIG.skillDifficulty
+
+        -- 运行期只保留配置里的那一个候选（BOSS_CANDIDATES 是 main 表 entry/name 的容器）
+        local configuredEntry = tonumber(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].entry or 0) or 0
+        local configuredName = ResolveBossCandidateName(configuredEntry, BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].name)
+
+        BOSS_CANDIDATES = {
+            {entry = configuredEntry, name = configuredName},
+        }
+
+        if activeBossInfo and tonumber(activeBossInfo.entry or 0) == configuredEntry then
+            activeBossInfo.name = configuredName
+        end
+
+        return configuredEntry, configuredName
     end
 
-    local currentCandidate = BOSS_CANDIDATES[1] or {entry = 647, name = "活动Boss"}
-    local configuredEntry = ClampInteger(GetQueryUInt(query, 0, currentCandidate.entry or 647), 1, 2000000)
-    local configuredName = GetQueryString(query, 1, ResolveBossCandidateName(configuredEntry, currentCandidate.name))
+    -- ---------------------------------------------------------------- 展示（GM 命令）
+    local function DescribeConfigValue(descriptor, value)
+        local kind = descriptor.kind
 
-    BOSS_CANDIDATES = {
-        {entry = configuredEntry, name = configuredName},
-    }
+        if kind == "bool" then
+            return value and "true" or "false"
+        end
 
-    BOSS_CONFIG.bossLevel = ClampInteger(GetQueryUInt(query, 2, BOSS_CONFIG.bossLevel), 1, 255)
-    BOSS_CONFIG.bossScale = math.max(0.1, ScaledIntegerToNumber(GetQueryInt(query, 3, RoundToScaledInteger(BOSS_CONFIG.bossScale)), BOSS_CONFIG.bossScale))
-    BOSS_CONFIG.bossHealthMultiplier = math.max(0.1, ScaledIntegerToNumber(GetQueryInt(query, 4, RoundToScaledInteger(BOSS_CONFIG.bossHealthMultiplier)), BOSS_CONFIG.bossHealthMultiplier))
+        if kind == "scaled" then
+            return string.format("%.2f", tonumber(value) or 0)
+        end
 
-    BOSS_CONFIG.bossAuras = ParsePositiveIntegerList(GetQueryRawString(query, 5, SerializePositiveIntegerList(BOSS_CONFIG.bossAuras)))
+        if kind == "int" then
+            return tostring(math.floor(tonumber(value) or 0))
+        end
 
-    BOSS_CONFIG.allyLevel = ClampInteger(GetQueryUInt(query, 6, BOSS_CONFIG.allyLevel), 1, 255)
-    BOSS_CONFIG.allyHealthMultiplier = math.max(0.1, ScaledIntegerToNumber(GetQueryInt(query, 7, RoundToScaledInteger(BOSS_CONFIG.allyHealthMultiplier)), BOSS_CONFIG.allyHealthMultiplier))
-    BOSS_CONFIG.respawnTimeMinutes = ClampInteger(GetQueryUInt(query, 8, BOSS_CONFIG.respawnTimeMinutes), 1, 1440)
-    BOSS_CONFIG.minionCountMin = ClampInteger(GetQueryUInt(query, 9, BOSS_CONFIG.minionCountMin), 0, 20)
-    BOSS_CONFIG.minionCountMax = math.max(BOSS_CONFIG.minionCountMin, ClampInteger(GetQueryUInt(query, 10, BOSS_CONFIG.minionCountMax), 0, 20))
+        if kind == "intlist" then
+            return SerializePositiveIntegerList(value)
+        end
 
-    BOSS_CONFIG.skillPreset = GetQueryString(query, 11, BOSS_CONFIG.skillPreset)
-    BOSS_CONFIG.skillDifficulty = GetQueryString(query, 12, BOSS_CONFIG.skillDifficulty)
+        if kind == "lines" then
+            local list = type(value) == "table" and value or {}
+            return string.format("%d 条：%s", #list, table.concat(list, " / "))
+        end
 
-    REWARD_PROBABILITIES.guaranteedRewardEnabled = GetQueryUInt(query, 13, REWARD_PROBABILITIES.guaranteedRewardEnabled and 1 or 0) == 1
-    REWARD_PROBABILITIES.guaranteedRewardNotify = GetQueryUInt(query, 14, REWARD_PROBABILITIES.guaranteedRewardNotify and 1 or 0) == 1
-    REWARD_PROBABILITIES.maxRandomRewardPlayers = ClampInteger(GetQueryUInt(query, 15, REWARD_PROBABILITIES.maxRandomRewardPlayers), 0, 100)
-    REWARD_PROBABILITIES.classRewardChance = ClampInteger(GetQueryUInt(query, 16, REWARD_PROBABILITIES.classRewardChance), 0, 100)
-    REWARD_PROBABILITIES.formulaRewardChance = ClampInteger(GetQueryUInt(query, 17, REWARD_PROBABILITIES.formulaRewardChance), 0, 100)
-    REWARD_PROBABILITIES.mountRewardChance = ClampInteger(GetQueryUInt(query, 18, REWARD_PROBABILITIES.mountRewardChance), 0, 100)
-    REWARD_PROBABILITIES.randomRewardMode = GetQueryString(query, 19, REWARD_PROBABILITIES.randomRewardMode)
-    REWARD_PROBABILITIES.participationRange = ClampInteger(GetQueryUInt(query, 20, REWARD_PROBABILITIES.participationRange), 20, 500)
-    REWARD_PROBABILITIES.damageWeight = ClampInteger(GetQueryUInt(query, 21, REWARD_PROBABILITIES.damageWeight), 0, 10000)
-    REWARD_PROBABILITIES.healingWeight = ClampInteger(GetQueryUInt(query, 22, REWARD_PROBABILITIES.healingWeight), 0, 10000)
-    REWARD_PROBABILITIES.threatWeight = ClampInteger(GetQueryUInt(query, 23, REWARD_PROBABILITIES.threatWeight), 0, 10000)
-    REWARD_PROBABILITIES.presenceWeight = ClampInteger(GetQueryUInt(query, 24, REWARD_PROBABILITIES.presenceWeight), 0, 10000)
-    REWARD_PROBABILITIES.killWeight = ClampInteger(GetQueryUInt(query, 25, REWARD_PROBABILITIES.killWeight), 0, 10000)
+        if kind == "keyedlines" or kind == "keyedword" then
+            local text = SerializeKeyedLines(value)
+            return text ~= "" and ("{" .. text:gsub("\n", "; ") .. "}") or "{}"
+        end
 
-    REWARD_GUARANTEED.itemId = ClampInteger(GetQueryUInt(query, 26, REWARD_GUARANTEED.itemId), 0, 2000000)
-    REWARD_GUARANTEED.count = ClampInteger(GetQueryUInt(query, 27, REWARD_GUARANTEED.count), 0, 10000)
-    REWARD_GOLD.minCopper = ClampInteger(GetQueryUInt(query, 28, REWARD_GOLD.minCopper), 0, 2000000000)
-    REWARD_GOLD.maxCopper = math.max(REWARD_GOLD.minCopper, ClampInteger(GetQueryUInt(query, 29, REWARD_GOLD.maxCopper), 0, 2000000000))
+        if kind == "keyedintlist" then
+            local text = SerializeKeyedIntegerLists(value)
+            return text ~= "" and ("{" .. text:gsub("\n", "; ") .. "}") or "{}"
+        end
 
-    REWARD_ITEMS = ParsePositiveIntegerList(GetQueryRawString(query, 30, SerializePositiveIntegerList(REWARD_ITEMS)))
-    REWARD_FORMULAS = ParsePositiveIntegerList(GetQueryRawString(query, 31, SerializePositiveIntegerList(REWARD_FORMULAS)))
-    REWARD_MOUNTS = ParsePositiveIntegerList(GetQueryRawString(query, 32, SerializePositiveIntegerList(REWARD_MOUNTS)))
-    SPAWN_POINTS = ParseSpawnPointsText(GetQueryRawString(query, 33, SerializeSpawnPoints(DEFAULT_SPAWN_POINTS)), DEFAULT_SPAWN_POINTS)
+        if kind == "spawnpoints" then
+            local points = type(value) == "table" and value or {}
+            return string.format("%d 个刷新点", #points)
+        end
 
-    REWARD_PROBABILITIES:validate()
-    ApplySkillConfig(BOSS_CONFIG.skillPreset, BOSS_CONFIG.skillDifficulty)
-
-    if activeBossInfo and tonumber(activeBossInfo.entry or 0) == configuredEntry then
-        activeBossInfo.name = configuredName
+        local text = tostring(value or "")
+        return text ~= "" and text or "(空)"
     end
 
-    print(" [配置]已从 ac_eluna.boss_activity_config 载入配置: Entry=" .. configuredEntry .. ", 名称=" .. configuredName .. ", 刷新点=" .. tostring(#SPAWN_POINTS))
-    return true
+    local function FormatConfigLine(descriptor, value)
+        local text = DescribeConfigValue(descriptor, value)
+        if #text > 120 then
+            text = TruncateUtf8(text, 108) .. "..."
+        end
+
+        return string.format("  %s (%s) = %s", descriptor.column, descriptor.key or "-", text)
+    end
+
+    -- ---------------------------------------------------------------- 对外接口
+    ShowBossConfigGroups = function(player, chatHandler)
+        BossReply(player, chatHandler, true, "Boss 配置分组（用法: .boss config show <group>）：")
+
+        for _, groupKey in ipairs(BOSS_CONFIG_GROUP_ORDER) do
+            local count = 0
+            for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_MAIN) do
+                if descriptor.group == groupKey then count = count + 1 end
+            end
+            for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_EXT) do
+                if descriptor.group == groupKey then count = count + 1 end
+            end
+
+            if count > 0 then
+                BossSendMessage(player, chatHandler, string.format(
+                    "  %s = %s（%d 项）",
+                    groupKey,
+                    BOSS_CONFIG_GROUPS[groupKey] or groupKey,
+                    count))
+            end
+        end
+
+        BossSendMessage(player, chatHandler, "取值来源: ac_eluna." .. BOSS_MAIN_TABLE .. " + " .. BOSS_EXT_TABLE
+            .. "（面板可改主表；ext 表是脚本私有配置）")
+    end
+
+    ShowBossConfigGroup = function(player, chatHandler, groupKey)
+        local descriptors = {}
+        for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_MAIN) do
+            if descriptor.group == groupKey then descriptors[#descriptors + 1] = descriptor end
+        end
+        for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_EXT) do
+            if descriptor.group == groupKey then descriptors[#descriptors + 1] = descriptor end
+        end
+
+        if #descriptors == 0 then
+            BossReply(player, chatHandler, false, "没有这个配置分组：" .. tostring(groupKey))
+            ShowBossConfigGroups(player, chatHandler)
+            return false
+        end
+
+        BossReply(player, chatHandler, true, string.format(
+            "配置分组 %s（%s），共 %d 项：",
+            groupKey,
+            BOSS_CONFIG_GROUPS[groupKey] or groupKey,
+            #descriptors))
+
+        for _, descriptor in ipairs(descriptors) do
+            BossSendMessage(player, chatHandler, FormatConfigLine(descriptor, GetConfigTargetValue(descriptor)))
+        end
+
+        return true
+    end
+
+    -- insertIgnore = true：引导写入，只在「数据库里还没有这一行」时补默认值
+    -- insertIgnore = false：把当前运行期配置写回（切换技能池/档位时用）
+    PersistBossConfigToDB = function(insertIgnore)
+        EnsureBossSchema()
+        REWARD_PROBABILITIES:validate()
+
+        CharDBExecute(BuildBossUpsertSql(BOSS_MAIN_TABLE, BOSS_CONFIG_SCHEMA_MAIN, insertIgnore))
+        CharDBExecute(BuildBossUpsertSql(BOSS_EXT_TABLE, BOSS_CONFIG_SCHEMA_EXT, insertIgnore))
+    end
+
+    LoadBossConfigFromDB = function()
+        EnsureBossSchema()
+
+        -- 1) 引导：缺行时把 §3 的默认值写进两张表（已有配置不会被覆盖）
+        PersistBossConfigToDB(true)
+
+        -- 2) 主表（与 AGMP 面板共享）读不到就保持内存配置，返回 false 让调用方提示失败
+        local mainQuery = CharDBQuery(BuildBossSelectSql(BOSS_MAIN_TABLE, BOSS_CONFIG_SCHEMA_MAIN))
+        if mainQuery == nil then
+            print(" [配置]无法读取 " .. BOSS_MAIN_TABLE .. "，继续使用当前内存配置。")
+            REWARD_PROBABILITIES:validate()
+            ApplySkillConfig(BOSS_CONFIG.skillPreset, BOSS_CONFIG.skillDifficulty)
+            return false
+        end
+
+        ApplyBossConfigQuery(BOSS_CONFIG_SCHEMA_MAIN, mainQuery)
+
+        -- 3) 扩展表：读不到时保留文件内默认值（例如脚本刚升级、表还没建）
+        local extQuery = CharDBQuery(BuildBossSelectSql(BOSS_EXT_TABLE, BOSS_CONFIG_SCHEMA_EXT))
+        if extQuery ~= nil then
+            ApplyBossConfigQuery(BOSS_CONFIG_SCHEMA_EXT, extQuery)
+        else
+            print(" [配置]未读取到 " .. BOSS_EXT_TABLE .. "，喊话/嘲讽/巡逻等使用文件内默认值。")
+        end
+
+        local configuredEntry, configuredName = FinalizeBossConfig()
+
+        print(string.format(
+            " [配置]已从 ac_eluna 载入配置: 主表 %d 项 + 扩展表 %d 项；Entry=%d, 名称=%s, 刷新点=%d, 技能池=%s, 强度=%s",
+            #BOSS_CONFIG_SCHEMA_MAIN,
+            #BOSS_CONFIG_SCHEMA_EXT,
+            configuredEntry,
+            configuredName,
+            #SPAWN_POINTS,
+            GetCurrentSkillPresetLabel(),
+            GetCurrentSkillDifficultyLabel()))
+
+        return true
+    end
 end
 
 LoadBossConfigFromDB()
-
--- 【职业专属奖励】按职业分类的装备奖励
--- 键=职业ID（1=战士, 2=圣骑, 3=猎人, 4=盗贼, 5=牧师, 6=DK, 7=萨满, 8=法师, 9=术士, 11=德鲁伊）
--- 值=装备ID数组，随机选择一个
-
-local CLASS_REWARD_ITEMS = {
-    [1] = {40611,40614,40617,40620,40623,40256,40371,39257,40431,40257,40372}, -- 战士
-    [2] = {40622,40619,40616,40613,40610,40256,40371,39257,40431,40257,40372,40258,40382,39299}, -- 圣骑士
-    [3] = {40611,40614,40617,40620,40623,40256,40371,39257,40431}, -- 猎人
-    [4] = {40624,40621,40618,40615,40612,40256,40371,39257,40431}, -- 盗贼
-    [5] = {40622,40619,40616,40613,40610,40255,40373,40432,40258,40382,39299}, -- 牧师
-    [6] = {40624,40621,40618,40615,40612,40256,40371,39257,40431,40257,40372}, -- 死亡骑士
-    [7] = {40611,40614,40617,40620,40623,40255,40373,40432,40256,40371,39257,40431,40258,40382,39299}, -- 萨满
-    [8] = {40624,40621,40618,40615,40612,40255,40373,40432,39299}, -- 法师
-    [9] = {40622,40619,40616,40613,40610,40255,40373,40432,39299}, -- 术士
-    [11] = {40624,40621,40618,40615,40612,40255,40373,40432,40256,40371,39257,40431,40257,40372,40258,40382,39299}, -- 德鲁伊
-}
-
--- 【职业类型定义】用于AI目标选择策略
--- melee=近战（优先度低）  ranged=远程（优先度中）  healer=治疗（优先度高）
--- 第三阶段会优先攻击healer类型
-
-local CLASS_TYPES = {
-    [1] = "melee",    -- 战士
-    [2] = "healer",   -- 圣骑士（可切换为近战，但AI视为治疗威胁）
-    [3] = "ranged",   -- 猎人
-    [4] = "melee",    -- 盗贼
-    [5] = "healer",   -- 牧师
-    [6] = "melee",    -- 死亡骑士
-    [7] = "healer",   -- 萨满（可切换，AI视为治疗威胁）
-    [8] = "ranged",   -- 法师
-    [9] = "ranged",   -- 术士
-    [11] = "healer",  -- 德鲁伊（可切换，AI视为治疗威胁）
-}
 
 -- ========== 全局状态变量 ==========
 local scriptSpawnedBossGUIDs = {}
@@ -1481,7 +2298,8 @@ local function SafeGetGuidLow(unit)
     return 0
 end
 
-local function BossSendMessage(player, chatHandler, message)
+-- 回复走「玩家广播 → chatHandler → 控制台」三级回退；前置声明的 local 在这里赋值
+BossSendMessage = function(player, chatHandler, message)
     if player and player.SendBroadcastMessage then
         player:SendBroadcastMessage(message)
         return
@@ -1495,7 +2313,7 @@ local function BossSendMessage(player, chatHandler, message)
     basePrint(message)
 end
 
-local function BossReply(player, chatHandler, success, message)
+BossReply = function(player, chatHandler, success, message)
     local finalMessage = tostring(message or "")
     if player == nil then
         local marker = success and "[AGMP_OK] " or "[AGMP_ERROR] "
@@ -2962,12 +3780,12 @@ local function SmartBossAI(event, delay, calls, creature)
     end
     TrackEncounterPresence(creature, currentThreatList)
     
-    -- 计算阶段
+    -- 计算阶段（阈值可配：[phase] 组）
     local hp = creature:GetHealthPct()
     local prevPhase = state.phase
-    if hp > 70 then
+    if hp > BOSS_CONFIG.phase2HpThreshold then
         state.phase = 1
-    elseif hp > 20 then
+    elseif hp > BOSS_CONFIG.phase3HpThreshold then
         state.phase = 2
     else
         state.phase = 3
@@ -2984,24 +3802,28 @@ local function SmartBossAI(event, delay, calls, creature)
             to_phase = state.phase,
             health_pct = hp,
         })
-        -- 阶段切换触发特效
+        -- 阶段切换触发特效（法术ID与数量都可配：[phase] 组）
         if state.phase == 2 and not state.phase2Triggered then
             print(" [AI]阶段2触发：施放自由祝福")
-            creature:CastSpell(creature, 1044, true)  -- 自由祝福
+            if BOSS_CONFIG.phase2SpellId > 0 then
+                creature:CastSpell(creature, BOSS_CONFIG.phase2SpellId, true)  -- 自由祝福
+            end
             state.phase2Triggered = true
             local targetGuid = state.lastTargetGuid
             print(" [AI]阶段2召唤援军")
-            SummonMinions(creature, math.random(1, 2), targetGuid)
+            SummonMinions(creature, math.random(BOSS_CONFIG.phase2SummonCountMin, BOSS_CONFIG.phase2SummonCountMax), targetGuid)
             -- 阶段2喊话 + 援军召唤喊话
             TauntSystem:SendRandomTaunt(creature, BOSS_CONFIG.combatTaunts.phase2Yells)
             TauntSystem:SendSummonTaunt(creature)
         elseif state.phase == 3 and not state.phase3Triggered then
             print(" [AI]阶段3触发：施放狂暴")
-            creature:CastSpell(creature, 8599, true)  -- 狂暴
+            if BOSS_CONFIG.phase3SpellId > 0 then
+                creature:CastSpell(creature, BOSS_CONFIG.phase3SpellId, true)  -- 狂暴
+            end
             state.phase3Triggered = true
             local targetGuid = state.lastTargetGuid
             print(" [AI]阶段3召唤援军")
-            SummonMinions(creature, 2, targetGuid)
+            SummonMinions(creature, BOSS_CONFIG.phase3SummonCount, targetGuid)
             -- 阶段3喊话 + 援军召唤喊话
             TauntSystem:SendRandomTaunt(creature, BOSS_CONFIG.combatTaunts.phase3Yells)
             TauntSystem:SendSummonTaunt(creature)
@@ -3009,13 +3831,13 @@ local function SmartBossAI(event, delay, calls, creature)
     end
     
     -- 极低血量嘲讽
-    if hp < 10 and not state.criticalHpYelled then
+    if hp < BOSS_CONFIG.criticalHpThreshold and not state.criticalHpYelled then
         state.criticalHpYelled = true
         TauntSystem:SendRandomTaunt(creature, BOSS_CONFIG.combatTaunts.criticalHpYells)
     end
     
-    -- 战斗时间过长嘲讽（每60秒一次）
-    if state.combatTime % 60000 < delay then
+    -- 战斗时间过长嘲讽（默认每 60 秒一次，可配）
+    if state.combatTime % BOSS_CONFIG.longCombatTauntIntervalMs < delay then
         TauntSystem:TryRandomCombatTaunt(creature, state)
     end
     
@@ -3059,9 +3881,9 @@ local function SmartBossAI(event, delay, calls, creature)
     
     -- 如果没有设置打断目标，进行常规目标选择
     if not target then
-        -- 每3次AI循环重新评估目标
+        -- 每 N 次AI循环重新评估目标（N 可配）
         state.targetEvalCounter = (state.targetEvalCounter or 0) + 1
-        if state.targetEvalCounter >= 3 or not IsUnitValid(victim) then
+        if state.targetEvalCounter >= BOSS_CONFIG.targetReevalLoops or not IsUnitValid(victim) then
             state.targetEvalCounter = 0
             -- 根据当前情况选择目标类型
             local preferType = nil
@@ -3106,11 +3928,11 @@ local function SmartBossAI(event, delay, calls, creature)
     -- 嘲讽低血量目标
     if IsUnitValid(target) then
         local success, hpPct = pcall(function() return target:GetHealthPct() end)
-        if success and hpPct and hpPct < 30 then
+        if success and hpPct and hpPct < BOSS_CONFIG.lowHpTauntThreshold then
             if not state.lowHpTauntCooldown then state.lowHpTauntCooldown = 0 end
             state.lowHpTauntCooldown = state.lowHpTauntCooldown - delay
             if state.lowHpTauntCooldown <= 0 then
-                state.lowHpTauntCooldown = 20000  -- 20秒冷却
+                state.lowHpTauntCooldown = BOSS_CONFIG.lowHpTauntCooldownMs
                 TauntSystem:SendRandomTaunt(creature, BOSS_CONFIG.combatTaunts.lowHpYells, {
                     ["{PLAYER_NAME}"] = SafeGetUnitName(target),
                 })
@@ -3989,13 +4811,14 @@ local function OnBossCommand(event, player, command, chatHandler)
         BossSendMessage(player, chatHandler, "1. .boss 或 .boss spawn 生成当前配置的Boss。")
         BossSendMessage(player, chatHandler, "2. .boss help 查看这份命令说明。")
         BossSendMessage(player, chatHandler, "3. .boss config reload 从 ac_eluna 重新载入活动 Boss 配置。")
-        BossSendMessage(player, chatHandler, "4. .boss preset list 查看所有技能池预设。")
-        BossSendMessage(player, chatHandler, "5. .boss preset <key> 切换技能池预设。")
-        BossSendMessage(player, chatHandler, "6. .boss difficulty list 查看所有技能强度档位。")
-        BossSendMessage(player, chatHandler, "7. .boss difficulty <key> 切换技能强度档位。")
-        BossSendMessage(player, chatHandler, "8. .boss rebase 按模板重算基准血量再套用倍率（需脱战）。")
-        BossSendMessage(player, chatHandler, "9. .boss kill 击杀当前活跃Boss（走正常死亡与奖励流程）。")
-        BossSendMessage(player, chatHandler, "10. .boss clear 直接移除当前活跃Boss并复位运行时记录（不发奖励）。")
+        BossSendMessage(player, chatHandler, "4. .boss config show [分组] 查看当前生效的配置项（不带分组则列出分组）。")
+        BossSendMessage(player, chatHandler, "5. .boss preset list 查看所有技能池预设。")
+        BossSendMessage(player, chatHandler, "6. .boss preset <key> 切换技能池预设。")
+        BossSendMessage(player, chatHandler, "7. .boss difficulty list 查看所有技能强度档位。")
+        BossSendMessage(player, chatHandler, "8. .boss difficulty <key> 切换技能强度档位。")
+        BossSendMessage(player, chatHandler, "9. .boss rebase 按模板重算基准血量再套用倍率（需脱战）。")
+        BossSendMessage(player, chatHandler, "10. .boss kill 击杀当前活跃Boss（走正常死亡与奖励流程）。")
+        BossSendMessage(player, chatHandler, "11. .boss clear 直接移除当前活跃Boss并复位运行时记录（不发奖励）。")
         BossSendMessage(player, chatHandler, "当前Boss: " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].name or "")
             .. " (Entry " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].entry or 0) .. ")")
         BossSendMessage(player, chatHandler, "当前技能池: " .. GetCurrentSkillPresetLabel())
@@ -4004,8 +4827,18 @@ local function OnBossCommand(event, player, command, chatHandler)
     end
 
     if action == "config" then
+        if parts[3] == "show" or parts[3] == "list" then
+            -- 配置现在以数据库为准，这里让 GM 不必开数据库就能看到当前生效值
+            if parts[4] and parts[4] ~= "" then
+                ShowBossConfigGroup(player, chatHandler, parts[4])
+            else
+                ShowBossConfigGroups(player, chatHandler)
+            end
+            return false
+        end
+
         if parts[3] ~= "reload" then
-            BossReply(player, chatHandler, false, "用法: .boss config reload")
+            BossReply(player, chatHandler, false, "用法: .boss config reload / .boss config show [分组]")
             return false
         end
 
@@ -4229,7 +5062,7 @@ local function OnBossCommand(event, player, command, chatHandler)
     end
 
     if action ~= nil and action ~= "" and action ~= "spawn" then
-        BossReply(player, chatHandler, false, "未知的 .boss 子命令（可用: spawn / help / config reload / preset / difficulty / rebase / kill / clear）。")
+        BossReply(player, chatHandler, false, "未知的 .boss 子命令（可用: spawn / help / config reload / config show / preset / difficulty / rebase / kill / clear）。")
         return false
     end
 

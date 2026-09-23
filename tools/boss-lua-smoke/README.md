@@ -33,11 +33,23 @@ cd E:\Server\tools\boss-lua-smoke
 |---|---|
 | 加载 | `EnsureBossSchema` / `LoadBossConfigFromDB` / `LoadBossRuntimeFromDB` / 事件注册全流程无运行期错误 |
 | 回归 | 全局 `print` 未被覆盖；`RegisterBossEventsFor*`、`activeBossInfo`、`IsManagedBossEntry` 不泄漏为全局 |
-| SQL | 配置引导写入（`INSERT IGNORE`）含新模板 entry 与 `spawn_points_text`；启动时写入 runtime 引导行 |
-| 命令 | `help` / `config reload` / `preset list` / `preset <key>` / `difficulty <key>` / `rebase` / `kill` / `clear` / `spawn` / 未知子命令 的标记与语义 |
+| SQL | 主表与扩展表（`boss_activity_config_ext`）的引导写入；扩展表建表语句与写入列一致；配置表不再用 `REPLACE INTO`；启动时写入 runtime 引导行 |
+| 配置 | 分组齐全（16 组）且项数之和等于描述表总数；喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板**确实取自数据库**（桩数据用与默认值不同的值）；数据库快照缺列会直接判失败（描述表改动后测试不会静默失效） |
+| 命令 | `help` / `config reload` / `config show [分组]` / `preset list` / `preset <key>` / `difficulty <key>` / `rebase` / `kill` / `clear` / `spawn` / 未知子命令 的标记与语义 |
 | 放行 | 非 boss 命令返回 `true`、不产生 boss 回复（不拦截其他 GM 指令） |
 | 副作用 | `.boss clear` 写 `command_clear` 事件并把 runtime 复位为 `idle` |
-| 事件 | `PLAYER_EVENT_ON_HEAL(42/65)` 与 4 个档位 entry 的 6 个 creature 事件全部注册 |
+| 事件 | `PLAYER_EVENT_ON_HEAL(42/65)` 与受管 entry（含 ext 表额外指定的档位 entry）的 6 个 creature 事件全部注册 |
+
+## 配置一致性（重构时用的一次性工具，不在本目录）
+
+判断「配置落库重构」是否改变行为，用的是 `tmp` 里的一次性脚本：
+
+1. `snapshot.lua <boss.lua> <out.txt> [nodb|live] [row.txt]`：用桩环境加载脚本，捕获
+   - `bootstrap.*` 引导写入语句（列名/顺序/取值/转义）
+   - `after-preset.*` 执行 `.boss preset ember_storm` 后的回写（= 从数据库解析出来的运行期配置）
+2. 对重构前 / 后的 boss.lua 各跑一次再 diff：主表 35 列必须逐字段一致。
+3. 把 `--dump-sql` 导出的语句替换库名后在 **scratch 库**（`CREATE DATABASE boss_verify`）里跑两遍，
+   验证真实的 MySQL 8.0 语法与 `ON DUPLICATE KEY UPDATE` 路径，最后 `DROP DATABASE`。
 
 ## ⚠ 安全警告（2026-09-23 真实事故）
 
@@ -57,6 +69,10 @@ cd E:\Server\tools\boss-lua-smoke
 
 ## 说明
 
-- 桩函数返回「无行」的 `CharDBQuery`，所以运行时会走**内存默认配置**分支；`boss_activity_config` 的 SELECT 则返回一份线上真实配置快照（`boss_entry=190090`、倍率 1500 等），用于校验配置解析与 SQL 构造。
+- 两张配置表的 SELECT 都返回一份**按列名给出**的快照：`boss_activity_config`（Boss 身份/属性/奖励）
+  与 `boss_activity_config_ext`（喊话/嘲讽/节奏/巡逻/小怪/职业/受管模板）。
+  ext 快照故意用与文件内默认值不同的值，用来断言「运行时确实以数据库为准」；
+  快照缺少描述表里的任何一列都会直接判失败，所以描述表加了列而快照没跟上不会静默通过。
+- runtime / events / contributors 的 SELECT 返回「无行」，走内存默认分支。
 - 桩环境里没有 `GetCreatureByGUID`：一旦脚本再引用它，会立刻以运行期错误暴露出来。
 - 本脚本不写任何文件（会刻意避开 `lua_scripts/lua_logs/`），也不连数据库。

@@ -6,9 +6,11 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 
 - Smart combat AI with multiple skill presets and difficulty modes.
 - **Selectable power tiers** backed by dedicated `creature_template` entries (see [Difficulty tiers](#difficulty-tiers)).
+- **All settings live in the database**: the script only ships defaults, the running config comes from `ac_eluna` (see [Where to change config](#where-to-change-config)).
 - Runtime persistence in `ac_eluna`:
   - `boss_activity_runtime`
-  - `boss_activity_config`
+  - `boss_activity_config` (shared with the AGMP panel)
+  - `boss_activity_config_ext` (script-private settings)
   - `boss_activity_events`
   - `boss_activity_contributors`
 - Automatic schema bootstrap and migration in Lua (no Web-side table creation required).
@@ -22,9 +24,56 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 | `.boss clear` (alias `.boss despawn`) | Remove the active boss without rewards and reset the runtime row |
 | `.boss rebase` | Recompute base health from the template and re-apply the multiplier (**out of combat only**) |
 | `.boss config reload` | Hot reload config from `ac_eluna` (used by AGMP after saving) |
+| `.boss config show [group]` | Print the effective config (no group = list the 16 groups) |
 | `.boss preset list` / `.boss preset <key>` | List / switch the skill preset |
 | `.boss difficulty list` / `.boss difficulty <key>` | List / switch the skill cadence tier |
 | `.boss help` | Help |
+
+## Where to change config
+
+`boss.lua` keeps **shipped defaults** in one place (§3 "配置区" at the top of the file).
+Once a row exists in the database those defaults are no longer used — bootstrap writes
+happen with `INSERT IGNORE`. Precedence:
+
+1. **AGMP panel** — the *Basic config* tab edits `boss_activity_config` (boss identity, stats, spawn points, skill preset, rewards); the *Extended config* tab edits `boss_activity_config_ext` (yells, taunts, AI cadence, phase thresholds, patrol, minions, helpers, classes, managed tiers), grouped into second-level tabs.
+2. **Database** — `boss_activity_config` (panel-shared columns) and `boss_activity_config_ext` (script-private columns).
+3. **Script §3 defaults** — only for a brand-new deployment without a config row.
+
+After editing, run `.boss config reload` (the panel does this automatically) or restart worldserver.
+
+### The two config tables
+
+| Table | Contents | Written by |
+|---|---|---|
+| `boss_activity_config` | Boss identity, level/scale/health multiplier, auras, ally helper, spawn points, skill preset, rewards | AGMP panel (`REPLACE INTO`, whole row) + Lua |
+| `boss_activity_config_ext` | Yells, combat taunts (12 text lists), AI cadence, phase thresholds, patrol, minion AI, helper entries, class types + class reward pools, managed tier entries | Lua (create/seed) + AGMP panel (`INSERT ... ON DUPLICATE KEY UPDATE`, submitted columns only) |
+
+Why two tables: AGMP saves the main table with `REPLACE INTO`, which resets every column it
+does not know about to the table default; script-private settings there would be wiped on each
+panel save. The panel only upserts the ext table, so columns the script adds later survive.
+
+### Adding a config item
+
+1. Add the default value in §3 (or reuse an existing field).
+2. Add one row to `BOSS_CONFIG_SCHEMA_MAIN` (panel-shared column: also update AGMP and the
+   `CREATE TABLE`) or `BOSS_CONFIG_SCHEMA_EXT` (script-private) with
+   `group / column / kind / target / key` (ext rows also need `ddl`).
+3. The ext table DDL, the read path, the write path and `.boss config show` all follow
+   automatically. To make it editable in the panel, add the column to AGMP's
+   `config/boss.php` (`ext_fields`, with type/bounds) plus its zh_CN/en label —
+   `php tools/verify_boss_ext_page.php` cross-checks the panel schema against this
+   descriptor table column by column.
+
+Value kinds (`kind`): `int`, `bool`, `scaled` (decimal ×100 stored as INT), `text`,
+`text_keep`, `intlist`, `lines`, `keyedlines`, `keyedword`, `keyedintlist`, `spawnpoints`.
+
+### What intentionally stays in the script
+
+- Skill presets / difficulty coefficients / interrupt spell pool (§5 content library): these
+  are combat *content* (spell ids, cooldowns, trigger conditions), released with the version;
+  the selectable parts (which preset, which tier) are in the database.
+- Display strings (class names), minion scatter distances and a few condition constants:
+  logic constants rather than tunables.
 
 ## Difficulty tiers
 
@@ -61,7 +110,7 @@ Instead of reusing `entry 647` (Captain Greenskin from the Deadmines, whose temp
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 27 invariants: load-time behaviour, SQL construction, command markers, `.boss clear` side effects, event registration, and the two regressions above ("no global `print` override", "no leaked globals"). See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 63 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values actually win over script defaults", `.boss clear` side effects, event registration, and the two regressions above ("no global `print` override", "no leaked globals"). See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
@@ -114,7 +163,12 @@ This script is compatible with the AGMP Boss module.
 
 - AGMP points to `ac_eluna` as custom DB for Boss module.
 - `boss_activity_config` contains a `spawn_points_text` column.
+- The panel writes the main table with `REPLACE INTO` (fixed column list) and the ext table with
+  `INSERT ... ON DUPLICATE KEY UPDATE` (submitted columns only) — add a main-table column only
+  together with the panel code, an ext-table column is safe on its own.
 - SOAP account has permission to execute Boss commands.
+- `php tools/verify_boss_ext_page.php` cross-checks the panel's ext schema against `boss.lua`'s
+  descriptor table and renders the page in both locales (81 checks).
 
 ## Security and Ops Notes
 
