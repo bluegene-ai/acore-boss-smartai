@@ -102,7 +102,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 ## 不启动服务器也能测
 
-`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 63 项不变量：加载流程、两张配置表的 SQL 构造、扩展表建表/写入列一致性、命令标记、`.boss config show` 输出、「数据库值确实覆盖脚本默认值」、`.boss clear` 副作用、事件注册，以及上面两处回归（"未覆盖全局 print"、"未泄漏全局变量"）。用法见 `tools/boss-lua-smoke/README.md`。
+`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 75 项不变量：加载流程、两张配置表的 SQL 构造、扩展表建表/写入列一致性、命令标记、`.boss config show` 输出、「数据库值确实覆盖脚本默认值」、`.boss clear` 副作用、事件注册、**多区绑定（改写常量后所有 SQL 必须跟着换库名/state_key）**，以及上面两处回归（"未覆盖全局 print"、"未泄漏全局变量"）。用法见 `tools/boss-lua-smoke/README.md`。
 
 ```
 lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
@@ -113,7 +113,7 @@ lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
 - AzerothCore 3.3.5a + Eluna（在 AzerothCore 使用的 Eluna 分支 `mod-ale` 上验证）。
 - MySQL/MariaDB，且能访问 `characters` 库。
 - 脚本放在 `lua_scripts` 加载路径下。
-- 脚本通过 `CharDBQuery`/`CharDBExecute` 访问 `ac_eluna` 库；库名是 `boss.lua` 顶部的 `BOSS_DB_NAME` 常量，若你的库名不同请修改。
+- 脚本通过 `CharDBQuery`/`CharDBExecute` 访问 `ac_eluna` 库；库名是 `boss.lua` 顶部的 `BOSS_DB_NAME` 常量，多区部署时每个区改成自己的库名（见下面「多区部署」），改完面板 `config/boss.php` 的 `server_overrides` 也要同步。
 
 ## 安装
 
@@ -121,6 +121,44 @@ lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
 2. （可选）用 `sql/2026_09_23_activity_boss_tiers_190090_190093.sql` 建专用模板，然后 `.reload creature_template`。
 3. 重启 `worldserver`（或 `.reload ale`）。
 4. 检查服务器日志中的建表/自举输出。
+5. 检查本区绑定：`lua_scripts/lua_logs/boss.log` 里应有一行
+   `[BOSS] 本区绑定: db=... configKey=... runtimeKey=...`。
+
+## 多区部署（多个 realm 共用一套 auth）
+
+一台机器上跑多个区时，**每个区各跑一份 worldserver + 一份 `boss.lua`**，活动 Boss 的配置、
+运行态、事件、贡献必须落在**各自的库**里：否则两个区会互相覆盖活动配置，面板上的表现是
+"改了没生效"或"看到的是别的区的 Boss"（事件/贡献表没有 `state_key` 列，共库时必然串在一起）。
+
+各区之间 `boss.lua` 的唯一差别是 §2 的两行：
+
+```lua
+local BOSS_DB_NAME = "ac_eluna"       -- 80 区沿用历史库名
+local BOSS_RUNTIME_KEY = "current"    -- 各区都用 current；只有共库时才需要不同
+```
+
+| 区 | worldserver 目录 | `BOSS_DB_NAME` | 面板 `server_overrides[<索引>].custom_db_name` |
+|---|---|---|---|
+| 70-阿达尔之辉 | `release\70` | `ac_eluna70` | `ac_eluna70` |
+| 80-女王的复仇 | `release\80` | `ac_eluna` | `ac_eluna` |
+| 删档测试区 | `release\test` | `ac_eluna_test` | `ac_eluna_test` |
+
+用 `tools/deploy-realm.ps1` 部署（自动改写常量 + 备份原文件 + 语法检查 + 打印面板片段）：
+
+```powershell
+# 先干跑看改动
+pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 -DryRun
+# 真部署（顺带导入难度档位模板到该区的 world 库）
+pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 `
+    -LuaExe <lua.exe> -ApplyTierSql acore_world70 -DbPassword <pw>
+```
+
+新区第一次启动时 `boss.lua` 会自建库与四张表（`CREATE DATABASE IF NOT EXISTS` +
+`CREATE TABLE IF NOT EXISTS`）并写入默认值；想让新区沿用老区的活动配置，可在老库导出
+`boss_activity_config` / `boss_activity_config_ext` 两行、改库名后导入新区库。
+
+`tools/boss-lua-smoke/smoke.lua` 会断言这件事：把 §2 常量改写后重新加载，所有引用库名的 SQL
+都必须跟着换成新库名、`state_key` 也必须跟着换，任何一处写死的 `ac_eluna` 都会让测试失败。
 
 ## 独立运行（不接 Web）
 

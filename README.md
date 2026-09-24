@@ -110,7 +110,7 @@ Instead of reusing `entry 647` (Captain Greenskin from the Deadmines, whose temp
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 63 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values actually win over script defaults", `.boss clear` side effects, event registration, and the two regressions above ("no global `print` override", "no leaked globals"). See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 75 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values actually win over script defaults", `.boss clear` side effects, event registration, **multi-realm binding (rewrite the constants and every DB-qualified statement must follow the new schema/state_key)**, and the two regressions above ("no global `print` override", "no leaked globals"). See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
@@ -121,7 +121,7 @@ lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
 - AzerothCore 3.3.5a with Eluna enabled (tested against `mod-ale`, the Eluna fork used by AzerothCore).
 - MySQL/MariaDB with the `characters` DB accessible.
 - Script placed in the `lua_scripts` load path.
-- The script talks to the `ac_eluna` schema through `CharDBQuery`/`CharDBExecute`; the name is the `BOSS_DB_NAME` constant at the top of `boss.lua` — change it if your database is named differently.
+- The script talks to the `ac_eluna` schema through `CharDBQuery`/`CharDBExecute`; the name is the `BOSS_DB_NAME` constant at the top of `boss.lua`. When several realms share one auth database, give each realm its own schema (see "Multi-realm deployment" below) and mirror it in the panel's `config/boss.php` `server_overrides`.
 
 ## Install
 
@@ -129,6 +129,49 @@ lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
 2. (Optional) Create the dedicated templates with `sql/2026_09_23_activity_boss_tiers_190090_190093.sql`, then `.reload creature_template`.
 3. Restart `worldserver` (or `.reload ale`).
 4. Verify server logs for schema bootstrap output.
+5. Verify the realm binding: `lua_scripts/lua_logs/boss.log` must contain
+   `[BOSS] 本区绑定: db=... configKey=... runtimeKey=...`.
+
+## Multi-realm deployment (several realms sharing one auth database)
+
+Each realm runs its own `worldserver` **and its own copy of `boss.lua`**, and the boss activity
+config, runtime state, events and contributor snapshots must live in **that realm's own schema**.
+Sharing one schema between realms makes them overwrite each other's activity config (the panel then
+shows "my change did nothing" or "that is the other realm's boss"), because the event and
+contributor tables carry no `state_key` column and would interleave.
+
+The only per-realm difference in `boss.lua` is the two constants in §2:
+
+```lua
+local BOSS_DB_NAME = "ac_eluna"       -- realm 80 keeps the historical name
+local BOSS_RUNTIME_KEY = "current"    -- "current" everywhere unless two realms share a schema
+```
+
+| Realm | worldserver dir | `BOSS_DB_NAME` | panel `server_overrides[<index>].custom_db_name` |
+|---|---|---|---|
+| 70 | `release\70` | `ac_eluna70` | `ac_eluna70` |
+| 80 | `release\80` | `ac_eluna` | `ac_eluna` |
+| test | `release\test` | `ac_eluna_test` | `ac_eluna_test` |
+
+Deploy with `tools/deploy-realm.ps1` (rewrites the constants, backs up the previous file, optionally
+syntax-checks it, prints the panel snippet):
+
+```powershell
+# dry run first
+pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 -DryRun
+# real deployment, including the difficulty-tier templates for that realm's world DB
+pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 `
+    -LuaExe <lua.exe> -ApplyTierSql acore_world70 -DbPassword <pw>
+```
+
+On its first start in a new realm, `boss.lua` creates the schema and the four tables itself
+(`CREATE DATABASE IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS`) and seeds the defaults. To carry an
+existing realm's activity config over, export the two rows of `boss_activity_config` /
+`boss_activity_config_ext`, rename the schema in the dump and import it into the new realm.
+
+`tools/boss-lua-smoke/smoke.lua` asserts this: the constants are rewritten, the file is loaded again,
+and every DB-qualified statement must use the new schema and state_key — a hard-coded `ac_eluna`
+anywhere fails the test.
 
 ## Standalone Mode (Without Web)
 

@@ -2,6 +2,9 @@
 
 `smoke.lua` 用桩函数替换 Eluna/核心 API，把 `release/80/lua_scripts/boss.lua` 加载进一个独立的 Lua 环境里跑一遍，不需要启动 worldserver。
 
+> 多区部署请用 `tools/deploy-realm.ps1` 安装到各区（自动改写 §2 的本区库名常量 + 备份 + 语法检查），
+> 它改写的就是本测试断言的那两行常量。
+
 ## 为什么需要
 
 `boss.lua` 有 4000+ 行，纯语法检查（`luac -p`）发现不了下面这类**运行时**缺陷：
@@ -39,6 +42,7 @@ cd E:\Server\tools\boss-lua-smoke
 | 放行 | 非 boss 命令返回 `true`、不产生 boss 回复（不拦截其他 GM 指令） |
 | 副作用 | `.boss clear` 写 `command_clear` 事件并把 runtime 复位为 `idle` |
 | 事件 | `PLAYER_EVENT_ON_HEAL(42/65)` 与受管 entry（含 ext 表额外指定的档位 entry）的 6 个 creature 事件全部注册 |
+| 多区绑定 | 把 `BOSS_DB_NAME` / `BOSS_RUNTIME_KEY` 改写后重新加载，**每条引用库名的 SQL 都必须换成新库名**、runtime 语句必须用新 state_key，启动日志必须报出本区绑定；任何一处写死的 `ac_eluna` 都会失败 |
 
 ## 配置一致性（重构时用的一次性工具，不在本目录）
 

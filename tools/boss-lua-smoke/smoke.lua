@@ -496,6 +496,95 @@ end
 assertTrue(engineCallbacks.creature["190094/1"] ~= nil,
     "受管模板 entry 由 ext 表驱动（190094 也注册了事件）")
 
+-- ------------------------------------------------- 多区绑定（本区库名 / state_key）
+-- boss.lua 的「多区支持」只有一句话：部署到不同区时只改 §2 的 BOSS_DB_NAME /
+-- BOSS_RUNTIME_KEY，所有 SQL 都要跟着走。这里把常量改写后**重新加载一遍**，
+-- 逐条核对 SQL 真正用的库名。
+-- 为什么必须动态重载而不是只看源码：真正的风险是"某处又写死了 ac_eluna"，
+-- 写死的语句不会出现在源码里那两个常量上，只有跑起来才会在 SQL 里露出来。
+io.write("\n== 多区绑定（本区库名） ==\n")
+
+local function isDbQualified(sql)
+    return sql:find("`boss_activity", 1, true) ~= nil
+        or sql:find("CREATE DATABASE", 1, true) ~= nil
+end
+
+-- 返回 (引用了库名的语句数, 其中库名不对的语句数)
+local function auditBinding(sqlList, expectDb, label)
+    local qualified, wrong = 0, 0
+    local samples = {}
+    for _, item in ipairs(sqlList) do
+        if isDbQualified(item.sql) then
+            qualified = qualified + 1
+            local rest = item.sql:gsub("`" .. expectDb .. "`", "")
+            if item.sql:find("`" .. expectDb .. "`", 1, true) == nil or rest:find("`ac_eluna", 1, true) ~= nil then
+                wrong = wrong + 1
+                samples[#samples + 1] = item.sql
+            end
+        end
+    end
+
+    assertTrue(qualified > 0, label .. "：存在引用本区库的语句（检查项没有空跑）")
+    assertTrue(wrong == 0, label .. "：每条都指向 " .. expectDb .. "（不符 " .. wrong .. "/" .. qualified .. " 条）")
+    for i = 1, math.min(#samples, 3) do
+        io.write("        " .. samples[i]:sub(1, 160) .. "\n")
+    end
+end
+
+auditBinding(recorded.sql, "ac_eluna", "默认部署(ac_eluna)")
+
+-- 模拟把同一份 boss.lua 部署到 70 区：只改 §2 的两行常量
+local sourceHandle = assert(io.open(bossPath, "r"))
+local source = sourceHandle:read("*a")
+sourceHandle:close()
+
+local targetDb, targetRuntimeKey = "ac_eluna70", "realm70"
+local rewritten, dbSubs = source:gsub('(local BOSS_DB_NAME%s*=%s*")[^"]*(")', "%1" .. targetDb .. "%2", 1)
+local rewrittenKey, keySubs = rewritten:gsub('(local BOSS_RUNTIME_KEY%s*=%s*")[^"]*(")', "%1" .. targetRuntimeKey .. "%2", 1)
+assertTrue(dbSubs == 1, "BOSS_DB_NAME 常量可被改写（deploy-realm 脚本依赖同一处）")
+assertTrue(keySubs == 1, "BOSS_RUNTIME_KEY 常量可被改写")
+
+local bindingLogs = {}
+local childEnv = setmetatable({
+    print = function(msg) table.insert(bindingLogs, tostring(msg)) end,
+}, { __index = env })
+
+local boundary = #recorded.sql
+local childChunk, childErr = load(rewrittenKey, "@" .. bossPath .. ":realm-rewrite", "t", childEnv)
+if not childChunk then
+    fail("改写后加载失败: " .. tostring(childErr))
+else
+    local childOk, childRunErr = pcall(childChunk)
+    if not childOk then
+        fail("改写后运行期错误: " .. tostring(childRunErr))
+    end
+end
+
+local childSql = {}
+for i = boundary + 1, #recorded.sql do childSql[#childSql + 1] = recorded.sql[i] end
+auditBinding(childSql, targetDb, "改为 " .. targetDb .. " 的部署")
+
+-- 启动自检日志必须报出本区绑定：运维靠它确认没串区
+local bindingLine = nil
+for _, line in ipairs(bindingLogs) do
+    if line:find("本区绑定", 1, true) then bindingLine = line end
+end
+assertTrue(bindingLine ~= nil, "启动时打印本区绑定日志")
+if bindingLine then
+    assertTrue(bindingLine:find(targetDb, 1, true) ~= nil
+        and bindingLine:find(targetRuntimeKey, 1, true) ~= nil,
+        "绑定日志内容与本区一致（库名 + state_key）")
+end
+
+-- state_key 也必须跟着走：runtime 的引导/查询语句里要用改写后的 key
+local keySeen = false
+for _, item in ipairs(childSql) do
+    if item.sql:find("boss_activity_runtime", 1, true) and item.sql:find(targetRuntimeKey, 1, true) then
+        keySeen = true
+    end
+end
+assertTrue(keySeen, "runtime 语句使用本区 state_key（" .. targetRuntimeKey .. "）")
+
 -- --------------------------------------------------------------------- 汇总
 -- 可选：把本次运行生成的所有 SQL 落盘，便于人工复核语句是否符合预期。
 --   lua.exe smoke.lua <boss.lua> --dump-sql <out.sql>

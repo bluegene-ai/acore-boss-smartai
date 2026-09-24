@@ -7,9 +7,9 @@
 --  文件结构（按出现顺序；查找配置请直接跳到「配置区」）
 -- ----------------------------------------------------------------------------
 --   §1 日志系统                  boss.log 轮转 + 文件级 print 遮蔽
---   §2 常量                      库名 / state_key / 配置键
+--   §2 常量                      本区绑定（库名 / state_key）+ 配置键
 --   §3 配置区  ★                所有可调项的默认值（分组）+ 描述表 + 目标注册表
---   §4 数据库表结构自举          ac_eluna 四张表 + 配置扩展表（列由描述表生成）
+--   §4 数据库表结构自举          本区库（默认 ac_eluna）四张表 + 配置扩展表（列由描述表生成）
 --   §5 内容库                    技能池预设 / 强度档位 / 打断法术（非配置项）
 --   §6 序列化与 SQL 工具         clamp / 列表与键值文本 / 查询取值助手
 --   §7 配置读写                  描述表驱动：LoadBossConfigFromDB / PersistBossConfigToDB
@@ -74,7 +74,26 @@ basePrint(">>Script:BOSS SmartAI loading...OK")
 
 -- ========== §2 常量（不属于可调配置，改动需随版本发布） ==========
 -- 日志路径/轮转上限在 §1 里另有常量：日志先于数据库可用，不能落库。
-local BOSS_DB_NAME = "ac_eluna"                              -- 配置与运行态所在库
+--
+-- ★ 多区部署（多个 realm 共用一套 auth）：「本区绑定」就在下面两行。
+--   一台机器上每个区各跑一份 worldserver + 一份 boss.lua，各区的配置 / 运行态 / 事件 /
+--   贡献必须落在**各自的库**里，否则两个区会互相覆盖活动配置（面板上表现为"改了没生效"
+--   或"看到的是别的区的 Boss"）。所以同一个 boss.lua 部署到不同区时，只改这两行：
+--
+--     80 区（历史库名，保持不动）  BOSS_DB_NAME = "ac_eluna"
+--     70 区                        BOSS_DB_NAME = "ac_eluna70"
+--     删档测试区                    BOSS_DB_NAME = "ac_eluna_test"
+--
+--   BOSS_RUNTIME_KEY / BOSS_CONFIG_KEY 目前各区都用 "current"；只有当两个区**共用同一个库**
+--   时才需要给其中一个区换 key（不推荐，事件/贡献表没有 state_key 列，会串在一起）。
+--
+--   面板侧必须与这里一致，否则面板读写的是别的区：
+--     AGMP config/boss.php → server_overrides[<区服索引>].custom_db_name / .runtime_key
+--   用 tools/deploy-realm.ps1 部署时会自动改写这两行并打印对应的面板配置片段。
+--
+--   启动时本脚本会把生效的绑定写进本区日志（lua_scripts/lua_logs/boss.log），
+--   与面板页头显示的库名对照即可确认没有串区。
+local BOSS_DB_NAME = "ac_eluna"                              -- 本区：配置与运行态所在库
 local BOSS_RUNTIME_KEY = "current"                           -- boss_activity_runtime 的 state_key
 local BOSS_CONFIG_KEY = "current"                            -- 配置表的 state_key
 local BOSS_DECIMAL_SCALE = 100                               -- 小数落库缩放（倍率/体型 ×100 存 INT）
@@ -84,6 +103,11 @@ local BOSS_RUNTIME_TABLE = "boss_activity_runtime"           -- 运行态（活�
 local BOSS_EVENT_TABLE = "boss_activity_events"              -- 事件流水
 local BOSS_CONTRIBUTOR_TABLE = "boss_activity_contributors"  -- 贡献快照
 local BOSS_SCHEMA_READY = false
+
+-- 多区部署自检：把本区绑定写进本区日志。面板页头也会显示它读的是哪个库，
+-- 两处对不上就说明部署时库名没改成该区的（§2 顶部）。
+print(string.format("[BOSS] 本区绑定: db=%s configKey=%s runtimeKey=%s",
+    BOSS_DB_NAME, BOSS_CONFIG_KEY, BOSS_RUNTIME_KEY))
 
 -- 【前置声明】以下名字在文件后段才赋值。Lua 只在「声明之后」的代码里把它们当 local，
 -- 放在前面使用的函数会解析成全局变量（运行期为 nil，静默失效）。
@@ -2156,7 +2180,7 @@ do
             end
         end
 
-        BossSendMessage(player, chatHandler, "取值来源: ac_eluna." .. BOSS_MAIN_TABLE .. " + " .. BOSS_EXT_TABLE
+        BossSendMessage(player, chatHandler, "取值来源: " .. BOSS_DB_NAME .. "." .. BOSS_MAIN_TABLE .. " + " .. BOSS_EXT_TABLE
             .. "（面板可改主表；ext 表是脚本私有配置）")
     end
 
@@ -2226,7 +2250,8 @@ do
         local configuredEntry, configuredName = FinalizeBossConfig()
 
         print(string.format(
-            " [配置]已从 ac_eluna 载入配置: 主表 %d 项 + 扩展表 %d 项；Entry=%d, 名称=%s, 刷新点=%d, 技能池=%s, 强度=%s",
+            " [配置]已从 %s 载入配置: 主表 %d 项 + 扩展表 %d 项；Entry=%d, 名称=%s, 刷新点=%d, 技能池=%s, 强度=%s",
+            BOSS_DB_NAME,
             #BOSS_CONFIG_SCHEMA_MAIN,
             #BOSS_CONFIG_SCHEMA_EXT,
             configuredEntry,
@@ -4810,7 +4835,7 @@ local function OnBossCommand(event, player, command, chatHandler)
         BossReply(player, chatHandler, true, "Boss命令用法：")
         BossSendMessage(player, chatHandler, "1. .boss 或 .boss spawn 生成当前配置的Boss。")
         BossSendMessage(player, chatHandler, "2. .boss help 查看这份命令说明。")
-        BossSendMessage(player, chatHandler, "3. .boss config reload 从 ac_eluna 重新载入活动 Boss 配置。")
+        BossSendMessage(player, chatHandler, "3. .boss config reload 从 " .. BOSS_DB_NAME .. " 重新载入活动 Boss 配置。")
         BossSendMessage(player, chatHandler, "4. .boss config show [分组] 查看当前生效的配置项（不带分组则列出分组）。")
         BossSendMessage(player, chatHandler, "5. .boss preset list 查看所有技能池预设。")
         BossSendMessage(player, chatHandler, "6. .boss preset <key> 切换技能池预设。")
@@ -4843,7 +4868,7 @@ local function OnBossCommand(event, player, command, chatHandler)
         end
 
         if not LoadBossConfigFromDB() then
-            BossReply(player, chatHandler, false, "无法从 ac_eluna 读取 Boss 配置。")
+            BossReply(player, chatHandler, false, "无法从 " .. BOSS_DB_NAME .. " 读取 Boss 配置。")
             return false
         end
 
@@ -4865,7 +4890,7 @@ local function OnBossCommand(event, player, command, chatHandler)
             skill_difficulty = ACTIVE_SKILL_DIFFICULTY_KEY or BOSS_CONFIG.skillDifficulty,
         })
 
-        BossReply(player, chatHandler, true, "Boss 配置已从 ac_eluna 热加载。")
+        BossReply(player, chatHandler, true, "Boss 配置已从 " .. BOSS_DB_NAME .. " 热加载。")
         local configuredEntry = BOSS_CANDIDATES[1] and tonumber(BOSS_CANDIDATES[1].entry or 0) or 0
         if configuredEntry > 0 and previousEntry > 0 and configuredEntry ~= previousEntry then
             BossSendMessage(player, chatHandler, string.format(
