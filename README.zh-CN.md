@@ -133,24 +133,24 @@ lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
 各区之间 `boss.lua` 的唯一差别是 §2 的两行：
 
 ```lua
-local BOSS_DB_NAME = "ac_eluna"       -- 80 区沿用历史库名
+local BOSS_DB_NAME = "ac_eluna"       -- 默认库名（历史部署保持不变）
 local BOSS_RUNTIME_KEY = "current"    -- 各区都用 current；只有共库时才需要不同
 ```
 
 | 区 | worldserver 目录 | `BOSS_DB_NAME` | 面板 `server_overrides[<索引>].custom_db_name` |
 |---|---|---|---|
-| 70-阿达尔之辉 | `release\70` | `ac_eluna70` | `ac_eluna70` |
-| 80-女王的复仇 | `release\80` | `ac_eluna` | `ac_eluna` |
-| 删档测试区 | `release\test` | `ac_eluna_test` | `ac_eluna_test` |
+| 默认/第一个区 | `D:\AzerothCore\release\<realm-a>` | `ac_eluna`（脚本内置默认，不改） | 与左侧一致（通常不必写 override） |
+| 第二个区 | `D:\AzerothCore\release\<realm-b>` | `<realm-b>-eluna` | 与左侧一致 |
+| 第三个区 | … | `<realm-c>-eluna` | 与左侧一致 |
 
 用 `tools/deploy-realm.ps1` 部署（自动改写常量 + 备份原文件 + 语法检查 + 打印面板片段）：
 
 ```powershell
 # 先干跑看改动
-pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 -DryRun
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna -DryRun
 # 真部署（顺带导入难度档位模板到该区的 world 库）
-pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 `
-    -LuaExe <lua.exe> -ApplyTierSql acore_world70 -DbPassword <pw>
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna `
+    -LuaExe <lua.exe> -ApplyTierSql <该区 world 库> -DbPassword <pw>
 ```
 
 新区第一次启动时 `boss.lua` 会自建库与四张表（`CREATE DATABASE IF NOT EXISTS` +

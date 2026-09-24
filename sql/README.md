@@ -41,12 +41,12 @@ AGMP 保存主表时用 `REPLACE INTO` 重写整行，会把它不认识的列�
 
 1. 导入本 SQL：
    ```powershell
-   & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h 127.0.0.1 -P 43306 -u root -p `
-       --default-character-set=utf8mb4 acore_world80 < .\2026_09_23_activity_boss_tiers_190090_190093.sql
+   & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h 127.0.0.1 -P 3306 -u root -p `
+       --default-character-set=utf8mb4 acore_world < .\2026_09_23_activity_boss_tiers_190090_190093.sql
    ```
    （SQL 末尾会把 `ac_eluna.boss_activity_config.boss_entry` 设为 190090；重复执行是幂等的。）
    **多区注意**：末尾那次配置切换写的是 80 区的库名 `ac_eluna`。把它用在别的区时，
-   先把库名换成该区自己的库（例如 `ac_eluna70`），或者直接用
+   先把库名换成该区自己的库（例如 `<该区库>`），或者直接用
    `tools/deploy-realm.ps1 -ApplyTierSql <该区 world 库> -DbName <该区库>` —— 脚本会替你改写并导入。
 2. 让核心重新读取模板（游戏内 GM 或 AGMP 面板控制台通道）：
    ```

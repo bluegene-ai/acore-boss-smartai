@@ -12,12 +12,12 @@
 #
 #  用法：
 #    # 先干跑看改动，不写任何文件
-#    pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 -DryRun
+#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna -DryRun
 #    # 真部署
-#    pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70
+#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna
 #    # 连难度档位模板一起导进该区的 world 库
-#    pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 `
-#        -ApplyTierSql acore_world70
+#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna `
+#        -ApplyTierSql <that realm's world DB>
 #
 #  部署完记得：
 #    · 让该区 worldserver 重新加载 Eluna 脚本（游戏内 .reload ale，或重启该区）
@@ -26,7 +26,7 @@
 
 [CmdletBinding()]
 param(
-    # 该区的 worldserver 根目录（里面应有 lua_scripts\ 与 worldserver.exe），例如 E:\Server\release\70
+    # 该区的 worldserver 根目录（里面应有 lua_scripts\ 与 worldserver.exe），例如 D:\AzerothCore\release\<realm-b>
     [Parameter(Mandatory = $true)][string]$RealmRoot,
 
     # 该区 boss.lua 使用的库名，必须与面板 server_overrides 的 custom_db_name 一致
@@ -41,13 +41,13 @@ param(
     # 可选：Lua 解释器路径，给了就对新文件做一次语法检查
     [string]$LuaExe = '',
 
-    # 可选：把难度档位 SQL 导入这个 world 库（如 acore_world70）
+    # 可选：把难度档位 SQL 导入这个 world 库（如 <该区 world 库>）
     [string]$ApplyTierSql = '',
 
     # 可选：MySQL 客户端与连接参数（仅在 -ApplyTierSql 时需要）
     [string]$MysqlExe = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe',
     [string]$DbHost = '127.0.0.1',
-    [int]$DbPort = 43306,
+    [int]$DbPort = 3306,
     [string]$DbUser = 'root',
     [string]$DbPassword = '',
 

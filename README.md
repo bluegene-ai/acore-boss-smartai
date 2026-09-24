@@ -143,25 +143,25 @@ contributor tables carry no `state_key` column and would interleave.
 The only per-realm difference in `boss.lua` is the two constants in §2:
 
 ```lua
-local BOSS_DB_NAME = "ac_eluna"       -- realm 80 keeps the historical name
+local BOSS_DB_NAME = "ac_eluna"       -- built-in default; an existing realm keeps it
 local BOSS_RUNTIME_KEY = "current"    -- "current" everywhere unless two realms share a schema
 ```
 
 | Realm | worldserver dir | `BOSS_DB_NAME` | panel `server_overrides[<index>].custom_db_name` |
 |---|---|---|---|
-| 70 | `release\70` | `ac_eluna70` | `ac_eluna70` |
-| 80 | `release\80` | `ac_eluna` | `ac_eluna` |
-| test | `release\test` | `ac_eluna_test` | `ac_eluna_test` |
+| default / first | `D:\AzerothCore\release\<realm-a>` | `ac_eluna` (built-in default, unchanged) | same as the left column (usually no override needed) |
+| second | `D:\AzerothCore\release\<realm-b>` | `<realm-b>-eluna` | same as the left column |
+| third | … | `<realm-c>-eluna` | same as the left column |
 
 Deploy with `tools/deploy-realm.ps1` (rewrites the constants, backs up the previous file, optionally
 syntax-checks it, prints the panel snippet):
 
 ```powershell
 # dry run first
-pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 -DryRun
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna -DryRun
 # real deployment, including the difficulty-tier templates for that realm's world DB
-pwsh -File tools\deploy-realm.ps1 -RealmRoot E:\Server\release\70 -DbName ac_eluna70 `
-    -LuaExe <lua.exe> -ApplyTierSql acore_world70 -DbPassword <pw>
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna `
+    -LuaExe <lua.exe> -ApplyTierSql <that realm's world DB> -DbPassword <pw>
 ```
 
 On its first start in a new realm, `boss.lua` creates the schema and the four tables itself

@@ -23,12 +23,12 @@
 ```powershell
 # 建议在一个没有 lua_scripts 子目录的工作目录下运行：
 #   这样脚本打不开日志文件，所有输出都回到 stdout
-cd E:\Server\tools\boss-lua-smoke
-& <lua.exe> smoke.lua "E:/Server/release/80/lua_scripts/boss.lua"
+cd <acore-boss-smartai>\tools\boss-lua-smoke
+& <lua.exe> smoke.lua "D:/AzerothCore/release/<realm>/lua_scripts/boss.lua"
 # 退出码：0 = 全部通过，1 = 有断言失败，2 = 加载/运行期错误
 ```
 
-`lua.exe` 可以取 `E:\Server\.tmp-luacheck\lua.exe`（Lua 5.2.4），或任何 Lua 5.1/5.2 解释器。
+`lua.exe` 取任意 Lua 5.1/5.2 解释器（本仓库用 Lua 5.2.4 验证）。
 
 ## 覆盖范围
 

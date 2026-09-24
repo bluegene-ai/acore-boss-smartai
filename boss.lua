@@ -80,9 +80,9 @@ basePrint(">>Script:BOSS SmartAI loading...OK")
 --   贡献必须落在**各自的库**里，否则两个区会互相覆盖活动配置（面板上表现为"改了没生效"
 --   或"看到的是别的区的 Boss"）。所以同一个 boss.lua 部署到不同区时，只改这两行：
 --
---     80 区（历史库名，保持不动）  BOSS_DB_NAME = "ac_eluna"
---     70 区                        BOSS_DB_NAME = "ac_eluna70"
---     删档测试区                    BOSS_DB_NAME = "ac_eluna_test"
+--     默认库名（不改，等于本脚本的内置默认）  BOSS_DB_NAME = "ac_eluna"
+--     第二个区                                BOSS_DB_NAME = "<realm-b>-eluna"
+--     第三个区                                BOSS_DB_NAME = "<realm-c>-eluna"
 --
 --   BOSS_RUNTIME_KEY / BOSS_CONFIG_KEY 目前各区都用 "current"；只有当两个区**共用同一个库**
 --   时才需要给其中一个区换 key（不推荐，事件/贡献表没有 state_key 列，会串在一起）。

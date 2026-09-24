@@ -8,7 +8,7 @@
 --
 --  用法（在任意目录，建议在无 lua_scripts 子目录的工作目录下运行，
 --  这样脚本打不开日志文件、所有输出都回到 stdout）：
---      lua.exe smoke.lua "E:\Server\release\80\lua_scripts\boss.lua"
+--      lua.exe smoke.lua "D:\AzerothCore\release\<realm>\lua_scripts\boss.lua"
 --
 --  覆盖：配置加载(SQL 构造/两张配置表)、扩展表建表与写入列一致、
 --        「数据库值覆盖脚本默认值」、运行时持久化、
@@ -16,7 +16,7 @@
 --        非 boss 命令放行，以及「全局 print 未被覆盖」「不再泄漏全局函数」两项回归断言。
 -- ============================================================================
 
-local bossPath = arg and arg[1] or "E:/Server/release/80/lua_scripts/boss.lua"
+local bossPath = arg and arg[1] or "lua_scripts/boss.lua"
 
 -- ---------------------------------------------------------------- 记录与断言
 local recorded = { sql = {}, events = {}, replies = {}, failures = {}, alters = {} }
@@ -538,7 +538,7 @@ local sourceHandle = assert(io.open(bossPath, "r"))
 local source = sourceHandle:read("*a")
 sourceHandle:close()
 
-local targetDb, targetRuntimeKey = "ac_eluna70", "realm70"
+local targetDb, targetRuntimeKey = "<realm-b>-eluna", "realm-b"
 local rewritten, dbSubs = source:gsub('(local BOSS_DB_NAME%s*=%s*")[^"]*(")', "%1" .. targetDb .. "%2", 1)
 local rewrittenKey, keySubs = rewritten:gsub('(local BOSS_RUNTIME_KEY%s*=%s*")[^"]*(")', "%1" .. targetRuntimeKey .. "%2", 1)
 assertTrue(dbSubs == 1, "BOSS_DB_NAME 常量可被改写（deploy-realm 脚本依赖同一处）")

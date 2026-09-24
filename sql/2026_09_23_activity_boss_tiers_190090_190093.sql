@@ -1,11 +1,11 @@
 -- ============================================================================
 --  活动 Boss 专用模板（AGMP「Boss 活动管理」→ 难度档位）
 --  文件：2026_09_23_activity_boss_tiers_190090_190093.sql
---  目标库：该区自己的 world 库（80 区 = acore_world80，70 区 = acore_world70 …）
+--  目标库：该区自己的 world 库（如 acore_world；多区时每个区一个）
 --          末尾另含一次配置切换，写的是 `ac_eluna`
 --
 --  ★ 多区注意：本文件末尾的 UPDATE 直接写了 `ac_eluna`（80 区的库名）。把本文件用在别的区
---    时，必须先把那个库名换成该区自己的库（如 `ac_eluna70`），否则会去改 80 区的活动配置。
+--    时，必须先把那个库名换成该区自己的库（如 `<该区库>`），否则会去改默认区的活动配置。
 --    正确做法：用 tools/deploy-realm.ps1 -ApplyTierSql <该区 world 库>，它会按 -DbName 改写后再导入。
 --
 --  为什么需要这个文件：
@@ -37,7 +37,7 @@
 --    （Archavon 165/36.8、Toravon 330/107.3、Lich King 1250/139），需要那种量级时照抄即可。
 --
 --  用法（示例）：
---    "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h 127.0.0.1 -P 43306 -u root -p acore_world80 < 本文件
+--    "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h 127.0.0.1 -P 3306 -u root -p acore_world < 本文件
 --    然后执行（游戏内 GM 或 AGMP 面板）: .reload creature_template
 --    面板「Boss 活动管理 → 难度档位」选择档位并保存即写入 boss_activity_config.boss_entry。
 -- ============================================================================
