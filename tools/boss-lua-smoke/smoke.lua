@@ -19,7 +19,13 @@
 local bossPath = arg and arg[1] or "lua_scripts/boss.lua"
 
 -- ---------------------------------------------------------------- 记录与断言
-local recorded = { sql = {}, events = {}, replies = {}, failures = {}, alters = {} }
+local recorded = { sql = {}, events = {}, replies = {}, failures = {}, alters = {}, spawnAttempts = 0 }
+local scheduledEvents = {}
+
+-- 可控时钟：定时启停要看"此刻是否在时间段内"，必须能设定现在几点。
+-- boss.lua 的 BossNow() 优先用 GetGameTime()，所以改写它即可（os.date 仍按真实时区解析）。
+local fakeNow = os.time{year = 2026, month = 9, day = 1, hour = 3, min = 0, sec = 0}
+local function setNow(value) fakeNow = value end
 local function fail(msg)
     table.insert(recorded.failures, msg)
     io.write("  [FAIL] " .. msg .. "\n")
@@ -86,6 +92,10 @@ local EXT_VALUES = {
     helper_entries_text = "11111,22222", ally_helper_entry = 20000,
     class_types_text = "1=melee\n2=healer", class_reward_items_text = "1=40611\n2=40622",
     managed_tier_entries_text = "190090,190091,190092,190093,190094",
+    -- [schedule] 定时启停：故意用与文件内默认值不同的值（脚本默认是关闭 + 空时间段）
+    activity_schedule_enabled = 1,
+    activity_schedule_windows = "20:00-22:00; 1-5@08:00-09:00",
+    activity_schedule_clear_on_close = 1,
 }
 
 -- 模拟「扩展表已存在、但脚本升级后描述表多了列」的线上状态：
@@ -101,9 +111,26 @@ local mockExtColumns = { state_key = true, updated_at = true }
 for column in pairs(EXT_VALUES) do mockExtColumns[column] = true end
 for _, column in ipairs(PHASE_COLUMNS) do mockExtColumns[column] = nil end
 
+-- 再模拟一次"脚本升级后描述表又多了定时启停三列"：加载时必须自动补列。
+local SCHEDULE_COLUMNS = {
+    "activity_schedule_enabled", "activity_schedule_windows", "activity_schedule_clear_on_close",
+}
+for _, column in ipairs(SCHEDULE_COLUMNS) do mockExtColumns[column] = nil end
+
+-- 运行态表的定时启停三列也按"老库还没有"处理（面板读不到时会降级显示，脚本自己要补）
+local mockRuntimeColumns = {
+    schedule_state = false, schedule_window = false, schedule_next_change_at = false,
+}
+
 local function mockInformationSchema(sql)
     -- 只有扩展表的列状态是「脚本升级后缺列」的模拟状态；其它表按列齐全处理
     if not sql:find("boss_activity_config_ext", 1, true) then
+        if sql:find("boss_activity_runtime", 1, true) then
+            local runtimeColumn = sql:match("COLUMN_NAME = '([%w_]+)'")
+            if runtimeColumn then
+                return mockQuery({ mockRuntimeColumns[runtimeColumn] and 1 or 0 })
+            end
+        end
         return mockQuery({ 1 })
     end
 
@@ -169,24 +196,39 @@ env.CharDBExecute = function(sql)
     -- 补列必须真的改变「表结构」，否则后面的查询/写入还是按缺列状态走
     local addedColumn = sql:match("ADD COLUMN `([%w_]+)`")
     if addedColumn then
-        if mockExtColumns[addedColumn] then
-            fail("重复补列: " .. addedColumn)
+        if sql:find("boss_activity_runtime", 1, true) then
+            if mockRuntimeColumns[addedColumn] == true then
+                fail("重复补列(runtime): " .. addedColumn)
+            end
+            mockRuntimeColumns[addedColumn] = true
+        else
+            if mockExtColumns[addedColumn] then
+                fail("重复补列: " .. addedColumn)
+            end
+            mockExtColumns[addedColumn] = true
         end
-        mockExtColumns[addedColumn] = true
         recorded.alters[#recorded.alters + 1] = addedColumn
+        recorded.altersSql = recorded.altersSql or {}
+        recorded.altersSql[#recorded.altersSql + 1] = sql
     end
 end
 
 env.WorldDBQuery = env.CharDBQuery
 env.WorldDBExecute = env.CharDBExecute
 
-env.GetGameTime = function() return os.time() end
+env.GetGameTime = function() return fakeNow end
 env.SendWorldMessage = function(msg) table.insert(recorded.replies, "[WORLD] " .. tostring(msg)) end
 env.GetPlayersInWorld = function() return {} end
 env.GetPlayerByGUID = function() return nil end
-env.CreateLuaEvent = function() return 1 end
+env.CreateLuaEvent = function(fn, delay, repeats)
+    scheduledEvents[#scheduledEvents + 1] = {fn = fn, delay = delay, repeats = repeats}
+    return #scheduledEvents
+end
 env.RemoveEventById = function() end
-env.PerformIngameSpawn = function() return nil end
+env.PerformIngameSpawn = function()
+    recorded.spawnAttempts = (recorded.spawnAttempts or 0) + 1
+    return nil
+end
 env.GetMapById = function() return nil end
 env.GetUnitGUID = function(low, entry) return tostring(low) .. ":" .. tostring(entry) end
 env.RegisterCreatureEvent = function(entry, ev, fn)
@@ -368,7 +410,9 @@ local cases = {
     { cmd = "boss rebase",            expect = "AGMP_ERROR", name = ".boss rebase（无活跃 Boss）" },
     { cmd = "boss kill",              expect = "AGMP_ERROR", name = ".boss kill（无活跃 Boss）" },
     { cmd = "boss clear",             expect = "AGMP_OK",    name = ".boss clear（无活跃 Boss）" },
-    { cmd = "boss spawn",             expect = "AGMP_ERROR", name = ".boss spawn（桩函数生成失败）" },
+    { cmd = "boss schedule",          expect = "AGMP_OK",    name = ".boss schedule" },
+    { cmd = "boss spawn",             expect = "AGMP_ERROR", name = ".boss spawn（定时计划在时段外 → 拒绝）" },
+    { cmd = "boss spawn force",       expect = "AGMP_ERROR", name = ".boss spawn force（桩生成失败）" },
     { cmd = "boss nonsense",          expect = "AGMP_ERROR", name = ".boss 未知子命令" },
 }
 
@@ -389,13 +433,13 @@ local groupText = table.concat(groupMessages, " | ")
 assertTrue(#groupMessages > 0, ".boss config show 有输出")
 local groupKeys = {
     "identity", "basic", "ally", "yells", "taunts", "ai", "phase", "patrol",
-    "minion", "skill", "respawn", "spawnpoints", "helper", "reward", "class", "tier",
+    "minion", "skill", "respawn", "spawnpoints", "schedule", "helper", "reward", "class", "tier",
 }
 local missingGroups = {}
 for _, group in ipairs(groupKeys) do
     if not groupText:find(group, 1, true) then missingGroups[#missingGroups + 1] = group end
 end
-assertTrue(#missingGroups == 0, "配置分组齐全（16 组）" ..
+assertTrue(#missingGroups == 0, "配置分组齐全（17 组）" ..
     (#missingGroups > 0 and ("（缺: " .. table.concat(missingGroups, ",") .. "）") or ""))
 
 -- 各组声明的项数之和必须等于描述表总数（漏登记会立刻暴露）
@@ -403,7 +447,7 @@ local listedTotal = 0
 for count in groupText:gmatch("（(%d+) 项）") do
     listedTotal = listedTotal + tonumber(count)
 end
-assertTrue(listedTotal >= 78, "分组项数之和覆盖全部配置项（当前 " .. listedTotal .. "）")
+assertTrue(listedTotal >= 81, "分组项数之和覆盖全部配置项（当前 " .. listedTotal .. "）")
 
 local function showGroup(group)
     return table.concat(runConsoleCommand("boss config show " .. group), " | ")
@@ -496,7 +540,162 @@ end
 assertTrue(engineCallbacks.creature["190094/1"] ~= nil,
     "受管模板 entry 由 ext 表驱动（190094 也注册了事件）")
 
+-- ------------------------------------------------- 定时启停（每天时间段自动开关）
+-- 三件事必须成立：
+--   1) 三个新配置列真的进了建表 / 引导写入 / 运行时写入（面板读同一份描述表）；
+--   2) 时间段解析与命中判定按「星期掩码 + 跨夜」正确（用可控时钟驱动 tick 断言）；
+--   3) 门控真的生效：时段外不生成、进入时段自动补生成、离开时段写结束事件。
+io.write("\n== 定时启停（时间段） ==\n")
+
+local scheduleColumns = {
+    "activity_schedule_enabled", "activity_schedule_windows", "activity_schedule_clear_on_close",
+}
+for _, column in ipairs(scheduleColumns) do
+    if extCreateSql then
+        assertTrue(extCreateSql:find("`" .. column .. "`", 1, true) ~= nil,
+            "扩展表建表语句含定时启停列 " .. column)
+    end
+    if extInsertSql then
+        assertTrue(extInsertSql:find("`" .. column .. "`", 1, true) ~= nil,
+            "扩展表引导写入含定时启停列 " .. column)
+    end
+end
+
+local runtimeScheduleColumns = false
+for _, item in ipairs(recorded.sql) do
+    if item.kind == "execute" and item.sql:find("boss_activity_runtime", 1, true)
+        and item.sql:find("`schedule_state`", 1, true)
+        and item.sql:find("`schedule_window`", 1, true)
+        and item.sql:find("`schedule_next_change_at`", 1, true) then
+        runtimeScheduleColumns = true
+    end
+end
+assertTrue(runtimeScheduleColumns, "runtime 写入语句含定时启停三列（面板读同一行显示）")
+
+-- 自动补列：线上老库（扩展表 + 运行态表）都没有这三列，加载时必须先 ALTER 再读写
+for _, column in ipairs(scheduleColumns) do
+    assertTrue(mockExtColumns[column] == true, "加载时自动补扩展表列 " .. column)
+end
+for column in pairs(mockRuntimeColumns) do
+    assertTrue(mockRuntimeColumns[column] == true, "加载时自动补运行态列 " .. tostring(column))
+end
+
+-- 组内取值必须来自 ext 表（面板保存的就是这三列）
+local scheduleShowText = showGroup("schedule")
+assertTrue(scheduleShowText:find("activity_schedule_enabled (scheduleEnabled) = true", 1, true) ~= nil,
+    "定时启停开关取自 ext 表")
+assertTrue(scheduleShowText:find("activity_schedule_windows (scheduleWindows) = 20:00-22:00; 1-5@08:00-09:00", 1, true) ~= nil,
+    "时间段文本取自 ext 表（分号 / @ / 逗号原样保留）")
+assertTrue(scheduleShowText:find("activity_schedule_clear_on_close (scheduleClearOnClose) = true", 1, true) ~= nil,
+    "离开时段清理开关取自 ext 表")
+
+-- tick 注册：每秒、无限重复（repeats=0）
+local scheduleTick = nil
+for _, item in ipairs(scheduledEvents) do
+    if item.delay == 1000 and item.repeats == 0 and scheduleTick == nil then
+        scheduleTick = item.fn
+    end
+end
+assertTrue(scheduleTick ~= nil, "定时启停 tick 已注册（1000ms / repeats=0）")
+
+if scheduleTick then
+    -- 从 2026-09-01 起找第一个满足星期条件的「某点某分」
+    local function clockAt(hour, minute, allowedWdays)
+        local base = os.time{year = 2026, month = 9, day = 1, hour = hour, min = minute, sec = 0}
+        for offset = 0, 13 do
+            local candidate = base + offset * 86400
+            if allowedWdays[tonumber(os.date("%w", candidate))] then
+                return candidate
+            end
+        end
+        return base
+    end
+
+    local weekdays = {[1] = true, [2] = true, [3] = true, [4] = true, [5] = true}
+    local weekend = {[0] = true, [6] = true}
+    local everyday = {[0] = true, [1] = true, [2] = true, [3] = true, [4] = true, [5] = true, [6] = true}
+
+    local insideWeekday = clockAt(8, 30, weekdays)   -- 命中 1-5@08:00-09:00
+    local outsideWeekend = clockAt(8, 30, weekend)   -- 星期掩码不匹配
+    local outsideNight = clockAt(23, 0, everyday)    -- 22:00 之后，两段都不在
+
+    -- 1) 星期掩码：周六 08:30 不在「工作日」段内 → 不生成
+    recorded.spawnAttempts = 0
+    setNow(outsideWeekend)
+    scheduleTick(0, 1000, 0)
+    assertTrue(recorded.spawnAttempts == 0, "星期掩码生效：周六 08:30 不在 1-5@08:00-09:00 内（不生成）")
+    local weekendText = table.concat(runConsoleCommand("boss schedule"), " | ")
+    assertTrue(weekendText:find("未到时间", 1, true) ~= nil, ".boss schedule 报告当前不在时间段内")
+
+    local closedPersisted = false
+    for _, item in ipairs(recorded.sql) do
+        if item.sql:find("boss_activity_runtime", 1, true) and item.sql:find("'closed'", 1, true) then
+            closedPersisted = true
+        end
+    end
+    assertTrue(closedPersisted, "不在时间段内时把运行态写成 closed（面板据此显示）")
+
+    -- 2) 进入时间段：写 schedule_open + 尝试生成一只
+    recorded.spawnAttempts = 0
+    local beforeOpen = #recorded.sql
+    setNow(insideWeekday)
+    scheduleTick(0, 1000, 0)
+    assertTrue(recorded.spawnAttempts == 1, "进入时间段 tick 补生成一只 Boss（桩生成失败也算尝试）")
+
+    local openEvent, openPersisted = false, false
+    for index = beforeOpen + 1, #recorded.sql do
+        local sql = recorded.sql[index].sql
+        if sql:find("schedule_open", 1, true) then openEvent = true end
+        if sql:find("boss_activity_runtime", 1, true) and sql:find("'open'", 1, true) then openPersisted = true end
+    end
+    assertTrue(openEvent, "进入时间段写入 schedule_open 事件")
+    assertTrue(openPersisted, "进入时间段把运行态写成 open")
+
+    local openText = table.concat(runConsoleCommand("boss schedule"), " | ")
+    assertTrue(openText:find("活动中", 1, true) ~= nil, ".boss schedule 报告当前在时间段内")
+
+    -- 3) 同一段内重复 tick：不重复生成（30 秒重试）、不重复写事件
+    recorded.spawnAttempts = 0
+    local beforeSecondTick = #recorded.sql
+    scheduleTick(0, 1000, 0)
+    assertTrue(recorded.spawnAttempts == 0, "同一时间段内不会每秒重复生成（30 秒重试窗口）")
+    local repeatedEvent = false
+    for index = beforeSecondTick + 1, #recorded.sql do
+        if recorded.sql[index].sql:find("schedule_open", 1, true) then repeatedEvent = true end
+    end
+    assertTrue(not repeatedEvent, "状态没翻转时不重复写 schedule_open 事件")
+
+    -- 4) 离开时间段：写 schedule_close，运行态回到 closed
+    recorded.spawnAttempts = 0
+    local beforeClose = #recorded.sql
+    setNow(outsideNight)
+    scheduleTick(0, 1000, 0)
+    assertTrue(recorded.spawnAttempts == 0, "离开时间段不会生成 Boss")
+
+    local closeEvent, closedAgain = false, false
+    for index = beforeClose + 1, #recorded.sql do
+        local sql = recorded.sql[index].sql
+        if sql:find("schedule_close", 1, true) then closeEvent = true end
+        if sql:find("boss_activity_runtime", 1, true) and sql:find("'closed'", 1, true) then closedAgain = true end
+    end
+    assertTrue(closeEvent, "离开时间段写入 schedule_close 事件")
+    assertTrue(closedAgain, "离开时间段把运行态写回 closed")
+
+    -- 5) 生成门控：时段外 .boss spawn 被拒；spawn force 放行
+    setNow(outsideNight)
+    recorded.spawnAttempts = 0
+    local blockedMarkers, blockedText = markersOf(runConsoleCommand("boss spawn"))
+    assertTrue(blockedMarkers:find("AGMP_ERROR", 1, true) ~= nil, "时段外 .boss spawn 返回 AGMP_ERROR")
+    assertTrue(blockedText:find("定时启停", 1, true) ~= nil, "时段外 .boss spawn 的回复里说明是定时计划拦下的")
+    assertTrue(recorded.spawnAttempts == 0, "时段外 .boss spawn 不会真的生成")
+
+    recorded.spawnAttempts = 0
+    runConsoleCommand("boss spawn force")
+    assertTrue(recorded.spawnAttempts == 1, ".boss spawn force 绕过定时计划（调试用）")
+end
+
 -- ------------------------------------------------- 多区绑定（本区库名 / state_key）
+
 -- boss.lua 的「多区支持」只有一句话：部署到不同区时只改 §2 的 key
 -- （BOSS_RUNTIME_KEY / BOSS_CONFIG_KEY，两行必须相同），四张表都靠这个 state_key 分租。
 -- 这里把常量改写后**重新加载一遍**，既核对 SQL 用的库名，也核对写入带的是本区 key。

@@ -38,7 +38,8 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 | 回归 | 全局 `print` 未被覆盖；`RegisterBossEventsFor*`、`activeBossInfo`、`IsManagedBossEntry` 不泄漏为全局 |
 | SQL | 主表与扩展表（`boss_activity_config_ext`）的引导写入；扩展表建表语句与写入列一致；配置表不再用 `REPLACE INTO`；启动时写入 runtime 引导行 |
 | 配置 | 分组齐全（16 组）且项数之和等于描述表总数；喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板**确实取自数据库**（桩数据用与默认值不同的值）；数据库快照缺列会直接判失败（描述表改动后测试不会静默失效） |
-| 命令 | `help` / `config reload` / `config show [分组]` / `preset list` / `preset <key>` / `difficulty <key>` / `rebase` / `kill` / `clear` / `spawn` / 未知子命令 的标记与语义 |
+| 命令 | `help` / `config reload` / `config show [分组]` / `preset list` / `preset <key>` / `difficulty <key>` / `rebase` / `kill` / `clear` / `schedule` / `spawn` / `spawn force` / 未知子命令 的标记与语义 |
+| 定时启停 | 三个新配置列（`activity_schedule_enabled` / `_windows` / `_clear_on_close`）进建表、引导写入与 runtime 写入；用**可控时钟**（改写 `GetGameTime`）驱动每秒 tick：星期掩码不匹配不生成、进入时段补生成 + `schedule_open`、同一段内不重复生成（30 秒重试）、离开时段写 `schedule_close`、时段外 `.boss spawn` 被拒而 `spawn force` 放行 |
 | 放行 | 非 boss 命令返回 `true`、不产生 boss 回复（不拦截其他 GM 指令） |
 | 副作用 | `.boss clear` 写 `command_clear` 事件并把 runtime 复位为 `idle` |
 | 事件 | `PLAYER_EVENT_ON_HEAL(42/65)` 与受管 entry（含 ext 表额外指定的档位 entry）的 6 个 creature 事件全部注册 |

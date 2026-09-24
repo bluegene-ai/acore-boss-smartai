@@ -6,6 +6,7 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 
 - Smart combat AI with multiple skill presets and difficulty modes.
 - **Selectable power tiers** backed by dedicated `creature_template` entries (see [Difficulty tiers](#difficulty-tiers)).
+- **Daily schedule**: start and stop the activity automatically by time windows (AGMP → Extended config → Schedule); see [Daily schedule](#daily-schedule).
 - **All settings live in the database**: the script only ships defaults, the running config comes from `ac_eluna` (see [Where to change config](#where-to-change-config)).
 - Runtime persistence in `ac_eluna`:
   - `boss_activity_runtime`
@@ -19,12 +20,14 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 
 | Command | Effect |
 |---|---|
-| `.boss` / `.boss spawn` | Spawn the boss at a configured spawn point |
+| `.boss` / `.boss spawn` | Spawn the boss at a configured spawn point (refused outside a schedule window) |
+| `.boss spawn force` | Spawn anyway while the schedule says otherwise (debugging) |
+| `.boss schedule` | Show the schedule, whether the current time is inside a window, and the next switch |
 | `.boss kill` | Kill the active boss through the normal death + reward flow |
 | `.boss clear` (alias `.boss despawn`) | Remove the active boss without rewards and reset the runtime row |
 | `.boss rebase` | Recompute base health from the template and re-apply the multiplier (**out of combat only**) |
 | `.boss config reload` | Hot reload config from `ac_eluna` (used by AGMP after saving) |
-| `.boss config show [group]` | Print the effective config (no group = list the 16 groups) |
+| `.boss config show [group]` | Print the effective config (no group = list the 17 groups) |
 | `.boss preset list` / `.boss preset <key>` | List / switch the skill preset |
 | `.boss difficulty list` / `.boss difficulty <key>` | List / switch the skill cadence tier |
 | `.boss help` | Help |
@@ -46,7 +49,7 @@ After editing, run `.boss config reload` (the panel does this automatically) or 
 | Table | Contents | Written by |
 |---|---|---|
 | `boss_activity_config` | Boss identity, level/scale/health multiplier, auras, ally helper, spawn points, skill preset, rewards | AGMP panel (`REPLACE INTO`, whole row) + Lua |
-| `boss_activity_config_ext` | Yells, combat taunts (12 text lists), AI cadence, phase thresholds, patrol, minion AI, helper entries, class types + class reward pools, managed tier entries | Lua (create/seed) + AGMP panel (`INSERT ... ON DUPLICATE KEY UPDATE`, submitted columns only) |
+| `boss_activity_config_ext` | Yells, combat taunts (12 text lists), AI cadence, phase thresholds, patrol, minion AI, helper entries, class types + class reward pools, managed tier entries, **daily schedule** | Lua (create/seed) + AGMP panel (`INSERT ... ON DUPLICATE KEY UPDATE`, submitted columns only) |
 
 Why two tables: AGMP saves the main table with `REPLACE INTO`, which resets every column it
 does not know about to the table default; script-private settings there would be wiped on each
@@ -74,6 +77,47 @@ Value kinds (`kind`): `int`, `bool`, `scaled` (decimal ×100 stored as INT), `te
   the selectable parts (which preset, which tier) are in the database.
 - Display strings (class names), minion scatter distances and a few condition constants:
   logic constants rather than tunables.
+
+## Daily schedule
+
+Run the activity only inside configured daily windows: **a boss is spawned when a window opens and the pending
+respawn timer is dropped when it closes** (by default the boss that is up is removed as well).
+
+Settings live in `boss_activity_config_ext` (AGMP → Extended config → Schedule):
+
+| Column | Default | Meaning |
+|---|---|---|
+| `activity_schedule_enabled` | `0` | Start/stop automatically by the windows below |
+| `activity_schedule_windows` | `''` | Window text, syntax below |
+| `activity_schedule_clear_on_close` | `1` | Remove the active boss when a window closes (`0` = only stop new spawns) |
+
+Window syntax (identical to AGMP's `app/Domain/Support/ScheduleWindows.php` — change both sides together):
+
+```
+08:00-09:00                  every day 08:00-09:00
+08:00-09:00; 20:00-22:00     several windows, separated by ";"
+1-5@20:00-23:00              Mon-Fri (1=Mon … 7=Sun; mon-fri and 一/日 also accepted)
+6,7@10:00-12:00              Sat + Sun
+22:00-02:00                  overnight (until 02:00 the next day)
+```
+
+Behaviour:
+
+- **The plan outranks manual control**: outside a window `.boss spawn` is refused with a hint
+  (`.boss spawn force` bypasses it for debugging). Inside a window the tick spawns a boss when none is up and no
+  respawn timer is pending (a failed spawn is retried after 30 seconds).
+- Enabled with empty/invalid windows = **never switches automatically** (a typo must not wipe a live boss);
+  invalid fragments only log one line and are skipped.
+- A killed boss still respawns after `respawn_time_minutes`; if that moment falls outside a window nothing is
+  scheduled and the next window spawns instead.
+- `.boss schedule` prints the plan and the current state. The runtime state (`off` / `empty` / `open` / `closed`,
+  the matched window and the next switch timestamp) is written to `boss_activity_runtime`
+  (`schedule_state` / `schedule_window` / `schedule_next_change_at`) and shown by the AGMP runtime card.
+- Time comes from the server's local clock (`os.date`); weekday masks refer to the day the window *starts*,
+  which is also how overnight windows are matched.
+
+The parser is shared with the chat-quiz module (`Acme\Panel\Domain\Support\ScheduleWindows`): the panel validates
+and normalises on save, and all switching happens in the Lua tick.
 
 ## Difficulty tiers
 
@@ -110,7 +154,7 @@ Instead of reusing `entry 647` (Captain Greenskin from the Deadmines, whose temp
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 75 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values actually win over script defaults", `.boss clear` side effects, event registration, **multi-realm binding (rewrite the constants and every DB-qualified statement must follow the new schema/state_key)**, and the two regressions above ("no global `print` override", "no leaked globals"). See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 90+ invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values actually win over script defaults", `.boss clear` side effects, event registration, **the daily schedule (a controllable clock drives the 1 s tick: weekday masks, spawn inside a window, `schedule_close` on the way out, `.boss spawn` refused outside a window while `force` passes, plus automatic column migration on an old schema)**, **multi-realm binding (rewrite the constants and every DB-qualified statement must follow the new schema/state_key)**, and the two regressions above ("no global `print` override", "no leaked globals"). See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass

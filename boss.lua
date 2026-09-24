@@ -14,8 +14,9 @@
 --   §6 序列化与 SQL 工具         clamp / 列表与键值文本 / 查询取值助手
 --   §7 配置读写                  描述表驱动：LoadBossConfigFromDB / PersistBossConfigToDB
 --   §8 运行期状态                内存态（活跃 Boss、AI 状态、贡献统计…）
+--   §8.5 定时启停                时间段解析 / 命中判定 / 下次切换（配置见 [schedule] 组）
 --   §9 通用工具 / 贡献统计 / 喊话 / 目标选择 / 技能决策 / 战术移动 / 巡逻
---   §10 Boss 生成与管理 / 事件处理 / GM 命令 / 事件注册
+--   §10 Boss 生成与管理 / 定时启停 tick / 事件处理 / GM 命令 / 事件注册
 --
 --  ★ 配置不再散落在脚本各处：所有可调项都在 §3 登记，运行期以数据库为准。
 --    表结构、列名、读写方式见 §3 描述表与 §4/§7。
@@ -158,8 +159,8 @@ end
 --    yells      喊话           taunts   战斗嘲讽       ai      AI 节奏
 --    phase      战斗阶段       patrol   巡逻           minion  小怪与援军
 --    skill      技能池         respawn  刷新间隔       spawnpoints 刷新点
---    helper     援军模板       reward   奖励           class   职业
---    tier       受管模板
+--    schedule   定时启停       helper   援军模板       reward  奖励
+--    class      职业           tier     受管模板
 --
 --  改配置：① AGMP 面板（基础配置 + 扩展配置两个 Tab）② 直接改数据库（两张表）
 --          ③ 改这里（只影响「数据库里还没有这一行」的全新部署）
@@ -392,6 +393,20 @@ local BOSS_CONFIG = {
     minionAiInterval = 1800,           -- 小怪智能决策间隔（毫秒）
     minionTargetRange = 40,            -- 小怪搜索玩家范围（码）
 
+    -- ---- [schedule] 定时启停（每天的时间段；默认关闭） ----
+    -- 时间段写法（与 AGMP 面板 ScheduleWindows.php 完全一致，改一边必须改另一边）：
+    --   多段之间用 ; 或换行分隔；不带星期前缀 = 每天
+    --     "08:00-09:00"                每天 08:00-09:00
+    --     "08:00-09:00, 20:00-22:00"   逗号分隔也可以（段里没有 @ 时逗号当分隔符）
+    --     "1-5@20:00-23:00"            周一至周五（1=周一 … 7=周日，也认 mon-fri / 一/日）
+    --     "6,7@10:00-12:00"            周六、周日
+    --     "22:00-02:00"                跨夜（到次日凌晨 2 点）
+    -- 行为：进入时间段自动生成 Boss；离开时间段停掉待重生计时，并按下面第三项决定是否清理
+    --       当前活跃 Boss。启用但时间段留空/写错 = 永不自动开关（不会清场，只会记日志）。
+    scheduleEnabled = false,           -- 是否按时间段自动开始/结束 Boss 活动
+    scheduleWindows = "",              -- 时间段文本；空 = 已启用但没有可用时间段
+    scheduleClearOnClose = true,       -- 离开时间段时是否清理当前活跃 Boss（false = 只停新刷新）
+
     -- ---- [skill] 技能池选择 ----
     -- 可选: storm_siege / ember_storm / frost_whiteout / venom_pursuit / grave_bombard / spellbreak_bulwark
     skillPreset = "storm_siege",
@@ -566,6 +581,7 @@ local BOSS_CONFIG_GROUPS = {
     skill = "技能池",
     respawn = "刷新间隔",
     spawnpoints = "刷新点",
+    schedule = "定时启停",
     helper = "援军模板",
     reward = "奖励",
     class = "职业",
@@ -574,7 +590,7 @@ local BOSS_CONFIG_GROUPS = {
 
 local BOSS_CONFIG_GROUP_ORDER = {
     "identity", "basic", "ally", "yells", "taunts", "ai", "phase", "patrol", "minion",
-    "skill", "respawn", "spawnpoints", "helper", "reward", "class", "tier",
+    "skill", "respawn", "spawnpoints", "schedule", "helper", "reward", "class", "tier",
 }
 
 -- ============================================================================
@@ -785,6 +801,13 @@ local BOSS_CONFIG_SCHEMA_EXT = {
     -- tier
     { group = "tier", column = "managed_tier_entries_text", kind = "intlist", keepDefaultWhenEmpty = true,
       ddl = "VARCHAR(255) NOT NULL DEFAULT ''", target = "BOSS_TIER_ENTRIES" },
+    -- schedule（定时启停：列加在描述表末尾，面板 ext_fields 也必须加在末尾，列序要一致）
+    { group = "schedule", column = "activity_schedule_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "scheduleEnabled" },
+    { group = "schedule", column = "activity_schedule_windows", kind = "text",
+      ddl = "VARCHAR(255) NOT NULL DEFAULT ''", target = "BOSS_CONFIG", key = "scheduleWindows" },
+    { group = "schedule", column = "activity_schedule_clear_on_close", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "scheduleClearOnClose" },
 }
 
 -- ============================================================================
@@ -1031,6 +1054,9 @@ local function EnsureBossSchema(force)
         .. '`last_engage_at` INT NOT NULL DEFAULT 0,'
         .. '`last_death_at` INT NOT NULL DEFAULT 0,'
         .. '`last_reset_at` INT NOT NULL DEFAULT 0,'
+        .. '`schedule_state` VARCHAR(16) NOT NULL DEFAULT "",'
+        .. '`schedule_window` VARCHAR(64) NOT NULL DEFAULT "",'
+        .. '`schedule_next_change_at` INT NOT NULL DEFAULT 0,'
         .. '`updated_at` INT NOT NULL DEFAULT 0,'
         .. 'PRIMARY KEY (`state_key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
     CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_EVENT_TABLE .. '` ('
@@ -1123,6 +1149,12 @@ local function EnsureBossSchema(force)
         'spawn_points_text',
         'TEXT NULL AFTER `reward_mounts_text`'
     )
+
+    -- 定时启停的运行态上报（面板「运行状态」卡片据此显示当前是否在时间段内）：
+    -- 老库缺列时自动补上，面板读不到这三列时会降级显示"未上报"，不会因此报错。
+    EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'schedule_state', 'VARCHAR(16) NOT NULL DEFAULT ""')
+    EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'schedule_window', 'VARCHAR(64) NOT NULL DEFAULT ""')
+    EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'schedule_next_change_at', 'INT NOT NULL DEFAULT 0')
 
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'account_id', 'INT NOT NULL DEFAULT 0')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'healing_done', 'BIGINT NOT NULL DEFAULT 0')
@@ -2341,7 +2373,337 @@ local bossRuntimeState = {
     lastEngageAt = 0,
     lastDeathAt = 0,
     lastResetAt = 0,
+    -- 定时启停的运行态上报（面板「运行状态」读这三项；由 tick 在状态翻转时落库）
+    scheduleState = "",
+    scheduleWindow = "",
+    scheduleNextChangeAt = 0,
 }
+
+-- ============================================================================
+--  §8.5 定时启停（时间段解析 / 命中判定 / 下次切换）
+-- ----------------------------------------------------------------------------
+--  配置项在 §3 的 [schedule] 组（ext 表列：activity_schedule_enabled /
+--  activity_schedule_windows / activity_schedule_clear_on_close）；
+--  真正的执行（到点生成 / 到点停）在 §10 的 ApplyBossScheduleTick 里。
+--
+--  时间段写法与 AGMP 面板的 ScheduleWindows.php **完全一致**，改一边必须改另一边：
+--    多段之间用 ; 或换行分隔；不带星期前缀 = 每天
+--      "08:00-09:00"                每天 08:00-09:00
+--      "08:00-09:00, 20:00-22:00"   逗号分隔也可以（段里没有 @ 时逗号当分隔符）
+--      "1-5@20:00-23:00"            周一至周五（1=周一 … 7=周日，也认 mon-fri / 一/日）
+--      "6,7@10:00-12:00"            周六、周日
+--      "22:00-02:00"                跨夜（到次日凌晨 2 点）
+--  非法片段只写一行日志并跳过，绝不让脚本崩掉（面板侧保存前就会拒绝非法写法）。
+--
+--  这里只做"纯函数"（给定时刻算状态），不碰数据库、不生成 Boss，便于离线冒烟测试。
+-- ============================================================================
+local GetBossScheduleWindows, BossScheduleActiveAt, BossScheduleNextChange
+local IsBossScheduleClosed, BossScheduleSummaryLine
+do
+    local SCHEDULE_DAY_NAMES = {
+        mon = 1, tue = 2, wed = 3, thu = 4, fri = 5, sat = 6, sun = 7,
+        ["一"] = 1, ["二"] = 2, ["三"] = 3, ["四"] = 4,
+        ["五"] = 5, ["六"] = 6, ["日"] = 7, ["天"] = 7,
+    }
+
+    local function Trim(text)
+        return (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+    end
+
+    -- "1" / "mon" / "一" → 1..7（1=周一）；无法识别返回 nil
+    local function DayNumber(token)
+        token = Trim(token)
+        if token == "" then
+            return nil
+        end
+
+        local number = tonumber(token)
+        if number ~= nil then
+            number = math.floor(number)
+            return (number >= 1 and number <= 7) and number or nil
+        end
+
+        return SCHEDULE_DAY_NAMES[token:lower()]
+    end
+
+    -- "1-5" / "6,7" / "mon-fri" → { [1]=true, ... }；无法识别返回 nil
+    local function ParseDaySet(text)
+        local days = {}
+        for chunk in tostring(text or ""):gmatch("[^,]+") do
+            chunk = Trim(chunk):gsub("%s+", "")
+            if chunk ~= "" then
+                local from, to = nil, nil
+                local dash = chunk:find("-", 1, true)
+                if dash ~= nil then
+                    from = DayNumber(chunk:sub(1, dash - 1))
+                    to = DayNumber(chunk:sub(dash + 1))
+                else
+                    from = DayNumber(chunk)
+                    to = from
+                end
+
+                if from == nil or to == nil then
+                    return nil
+                end
+
+                local day = from
+                while true do
+                    days[day] = true
+                    if day == to then
+                        break
+                    end
+                    day = day % 7 + 1
+                end
+            end
+        end
+
+        if next(days) == nil then
+            return nil
+        end
+
+        return days
+    end
+
+    -- "HH:MM-HH:MM" → from, to（当天分钟数）；无法识别返回 nil
+    local function ParseClockRange(text)
+        local h1, m1, h2, m2 = Trim(text):match("^(%d%d?):(%d%d)%s*%-%s*(%d%d?):(%d%d)$")
+        if h1 == nil then
+            return nil
+        end
+
+        h1, m1, h2, m2 = tonumber(h1), tonumber(m1), tonumber(h2), tonumber(m2)
+        if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59 then
+            return nil
+        end
+
+        return h1 * 60 + m1, h2 * 60 + m2
+    end
+
+    local function FormatClockRange(from, to)
+        return string.format("%02d:%02d-%02d:%02d",
+            math.floor(from / 60), from % 60, math.floor(to / 60), to % 60)
+    end
+
+    local function FormatDaySet(days)
+        local numbers = {}
+        for day in pairs(days) do
+            numbers[#numbers + 1] = day
+        end
+        table.sort(numbers)
+
+        return table.concat(numbers, ",")
+    end
+
+    -- 解析整段配置文本 → { {from, to, days, text}, ... }
+    --
+    -- 拆分规则（与面板 ScheduleWindows.php 一致）：
+    --   * 先用 ; 与换行切成段；
+    --   * 段里有 @ 时，@ 之前是星期、之后是时间；时间部分再按逗号拆（共享同一组星期），
+    --     所以 "1-5@08:00-09:00, 20:00-22:00" = 工作日两段；星期本身可以用逗号（"6,7@..."）；
+    --   * 段里没有 @ 时，整个段按逗号拆成多段（每天）。
+    local function ParseScheduleWindows(raw)
+        local list = {}
+
+        for piece in tostring(raw or ""):gmatch("[^;\r\n]+") do
+            local trimmed = Trim(piece)
+            if trimmed ~= "" then
+                local dayPart, timePart = nil, trimmed
+                local at = trimmed:match(".*()@")   -- 贪婪匹配 = 最后一个 @
+                if at ~= nil then
+                    dayPart = Trim(trimmed:sub(1, at - 1))
+                    timePart = trimmed:sub(at + 1)
+                end
+
+                local days = nil
+                local dayOk = true
+                if dayPart ~= nil then
+                    days = ParseDaySet(dayPart)
+                    if days == nil then
+                        print(string.format(" [定时启停]时间段「%s」的星期写法无法识别，已跳过这一段。", trimmed))
+                        dayOk = false
+                    end
+                end
+
+                if dayOk then
+                    for sub in timePart:gmatch("[^,]+") do
+                        sub = Trim(sub)
+                        if sub ~= "" then
+                            local from, to = ParseClockRange(sub)
+                            if from == nil or from == to then
+                                print(string.format(" [定时启停]时间段「%s」的时间段无法识别（应形如 08:00-09:00），已跳过这一段。", trimmed))
+                            else
+                                local label = FormatClockRange(from, to)
+                                if days ~= nil then
+                                    label = FormatDaySet(days) .. "@" .. label
+                                end
+                                list[#list + 1] = {from = from, to = to, days = days, text = label}
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        return list
+    end
+
+    -- 1=周一 … 7=周日（os.date 的 %w 是 0=周日）
+    local function IsoWeekday(t)
+        local wday = tonumber(os.date("%w", t)) or 0
+        return wday == 0 and 7 or wday
+    end
+
+    local function ClockMinutes(t)
+        local parts = os.date("*t", t)
+        return (tonumber(parts.hour) or 0) * 60 + (tonumber(parts.min) or 0)
+    end
+
+    -- 这一时刻是否落在某一段里；跨夜段（22:00-02:00）按「段开始的那天」判断星期
+    local function WindowActiveAt(t, window)
+        local minutes = ClockMinutes(t)
+        local day = IsoWeekday(t)
+
+        if window.from < window.to then
+            if window.days ~= nil and not window.days[day] then
+                return false
+            end
+
+            return minutes >= window.from and minutes < window.to
+        end
+
+        -- 跨夜：今天 from 点之后，或明天 to 点之前
+        if minutes >= window.from then
+            return window.days == nil or window.days[day] == true
+        end
+
+        if minutes < window.to then
+            local previous = day == 1 and 7 or (day - 1)
+            return window.days == nil or window.days[previous] == true
+        end
+
+        return false
+    end
+
+    BossScheduleActiveAt = function(t, list)
+        for index = 1, #list do
+            if WindowActiveAt(t, list[index]) then
+                return true, list[index]
+            end
+        end
+
+        return false, nil
+    end
+
+    -- 距下一次「计划状态翻转」还有多少秒（0 = 没有可用计划）。
+    -- 星期限制的段会先确认那一刻真的会开启，免得面板显示一个不会到来的时间。
+    BossScheduleNextChange = function(t, list)
+        if #list == 0 then
+            return 0
+        end
+
+        local best = nil
+        local dayStart = t - ClockMinutes(t) * 60 - (tonumber(os.date("%S", t)) or 0)
+
+        for index = 1, #list do
+            local window = list[index]
+            local windowActive = WindowActiveAt(t, window)
+
+            for offset = 0, 7 do
+                local base = dayStart + offset * 86400
+                local from = base + window.from * 60
+                local to = base + window.to * 60
+                if window.from >= window.to then
+                    to = to + 86400
+                end
+
+                if windowActive then
+                    if to > t and (best == nil or to < best) then
+                        best = to
+                    end
+                elseif from > t and (best == nil or from < best) and WindowActiveAt(from + 1, window) then
+                    best = from
+                end
+            end
+        end
+
+        if best == nil then
+            return 0
+        end
+
+        return best - t
+    end
+
+    local windowCache = {raw = nil, list = nil}
+
+    GetBossScheduleWindows = function()
+        local raw = tostring(BOSS_CONFIG.scheduleWindows or "")
+        if windowCache.raw ~= raw then
+            windowCache.raw = raw
+            windowCache.list = ParseScheduleWindows(raw)
+        end
+
+        return windowCache.list
+    end
+
+    local function FormatDuration(seconds)
+        seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+        local hours = math.floor(seconds / 3600)
+        local minutes = math.floor((seconds % 3600) / 60)
+        if hours > 0 then
+            return string.format("%d 小时 %d 分", hours, minutes)
+        end
+        if minutes > 0 then
+            return string.format("%d 分", minutes)
+        end
+
+        return string.format("%d 秒", seconds)
+    end
+
+    -- 定时计划此刻是否"不在时间段内"：未启用、启用但没写有效时间段都算「不拦」
+    -- （空时间段 = 永不自动开关，而不是"永远关闭"——否则一填错就把线上 Boss 全清了）。
+    IsBossScheduleClosed = function(t)
+        if BOSS_CONFIG.scheduleEnabled ~= true then
+            return false
+        end
+
+        local list = GetBossScheduleWindows()
+        if #list == 0 then
+            return false
+        end
+
+        return not BossScheduleActiveAt(t or BossNow(), list)
+    end
+
+    -- 供 `.boss schedule` / 面板展示的一行摘要
+    BossScheduleSummaryLine = function(t)
+        t = t or BossNow()
+        local list = GetBossScheduleWindows()
+        local parts = {}
+        for index = 1, #list do
+            parts[#parts + 1] = list[index].text
+        end
+
+        local windowText = #parts > 0 and table.concat(parts, "，") or "（无）"
+
+        if BOSS_CONFIG.scheduleEnabled ~= true then
+            return "定时启停：未启用；时间段：" .. windowText .. "（到 AGMP 面板「扩展配置 → 定时启停」启用）"
+        end
+
+        if #parts == 0 then
+            return "定时启停：已启用，但没有填写有效时间段 → 不会自动开关；时间段：" .. windowText
+        end
+
+        local active = BossScheduleActiveAt(t, list)
+        local nextIn = BossScheduleNextChange(t, list)
+        local state = active and "活动中" or "未到时间"
+        if nextIn > 0 then
+            state = state .. "，" .. (active and "距结束 " or "距下次开启 ") .. FormatDuration(nextIn)
+        end
+
+        return string.format("定时启停：已启用；时间段：%s；当前：%s；离开时段清理活跃Boss：%s",
+            windowText, state, BOSS_CONFIG.scheduleClearOnClose and "是" or "否")
+    end
+end
 
 -- ========== 工具函数 ==========
 
@@ -2520,6 +2882,9 @@ local function PersistBossRuntime(source, overrides)
     if overrides.last_engage_at ~= nil then bossRuntimeState.lastEngageAt = overrides.last_engage_at end
     if overrides.last_death_at ~= nil then bossRuntimeState.lastDeathAt = overrides.last_death_at end
     if overrides.last_reset_at ~= nil then bossRuntimeState.lastResetAt = overrides.last_reset_at end
+    if overrides.schedule_state ~= nil then bossRuntimeState.scheduleState = overrides.schedule_state end
+    if overrides.schedule_window ~= nil then bossRuntimeState.scheduleWindow = overrides.schedule_window end
+    if overrides.schedule_next_change_at ~= nil then bossRuntimeState.scheduleNextChangeAt = overrides.schedule_next_change_at end
 
     local bossGuid = overrides.boss_guid
     if bossGuid == nil then bossGuid = context.bossGuid or 0 end
@@ -2555,8 +2920,9 @@ local function PersistBossRuntime(source, overrides)
         "REPLACE INTO `%s`.`boss_activity_runtime` ("
             .. "`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `map_id`, `instance_id`, "
             .. "`home_x`, `home_y`, `home_z`, `phase`, `status`, `skill_preset`, `skill_difficulty`, "
-            .. "`respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at`, `updated_at`) "
-            .. "VALUES ('%s', %d, %d, '%s', %d, %d, %.3f, %.3f, %.3f, %d, '%s', '%s', '%s', %d, %d, %d, %d, %d, %d);",
+            .. "`respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at`, "
+            .. "`schedule_state`, `schedule_window`, `schedule_next_change_at`, `updated_at`) "
+            .. "VALUES ('%s', %d, %d, '%s', %d, %d, %.3f, %.3f, %.3f, %d, '%s', '%s', '%s', %d, %d, %d, %d, %d, '%s', '%s', %d, %d);",
         BOSS_DB_NAME,
         BOSS_RUNTIME_KEY,
         tonumber(bossGuid or 0) or 0,
@@ -2576,6 +2942,9 @@ local function PersistBossRuntime(source, overrides)
         tonumber(bossRuntimeState.lastEngageAt or 0) or 0,
         tonumber(bossRuntimeState.lastDeathAt or 0) or 0,
         tonumber(bossRuntimeState.lastResetAt or 0) or 0,
+        BossSqlEscape(bossRuntimeState.scheduleState or "", 16),
+        BossSqlEscape(bossRuntimeState.scheduleWindow or "", 64),
+        tonumber(bossRuntimeState.scheduleNextChangeAt or 0) or 0,
         BossNow()
     )
 
@@ -2619,7 +2988,7 @@ local function LoadBossRuntimeFromDB()
     EnsureBossSchema()
 
     local query = CharDBQuery(string.format(
-        "SELECT `boss_guid`, `boss_entry`, `boss_name`, `map_id`, `instance_id`, `home_x`, `home_y`, `home_z`, `phase`, `status`, `respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at` FROM `%s`.`boss_activity_runtime` WHERE `state_key`='%s' LIMIT 1;",
+        "SELECT `boss_guid`, `boss_entry`, `boss_name`, `map_id`, `instance_id`, `home_x`, `home_y`, `home_z`, `phase`, `status`, `respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at`, `schedule_state`, `schedule_window`, `schedule_next_change_at` FROM `%s`.`boss_activity_runtime` WHERE `state_key`='%s' LIMIT 1;",
         BOSS_DB_NAME,
         BOSS_RUNTIME_KEY
     ))
@@ -2643,6 +3012,9 @@ local function LoadBossRuntimeFromDB()
     local runtimeLastEngageAt = GetQueryUInt(query, 12, 0)
     local runtimeLastDeathAt = GetQueryUInt(query, 13, 0)
     local runtimeLastResetAt = GetQueryUInt(query, 14, 0)
+    local runtimeScheduleState = GetQueryString(query, 15, "")
+    local runtimeScheduleWindow = GetQueryString(query, 16, "")
+    local runtimeScheduleNextChangeAt = GetQueryUInt(query, 17, 0)
 
     bossRuntimeState.phase = runtimePhase
     bossRuntimeState.status = runtimeStatus
@@ -2651,6 +3023,9 @@ local function LoadBossRuntimeFromDB()
     bossRuntimeState.lastEngageAt = runtimeLastEngageAt
     bossRuntimeState.lastDeathAt = runtimeLastDeathAt
     bossRuntimeState.lastResetAt = runtimeLastResetAt
+    bossRuntimeState.scheduleState = runtimeScheduleState
+    bossRuntimeState.scheduleWindow = runtimeScheduleWindow
+    bossRuntimeState.scheduleNextChangeAt = runtimeScheduleNextChangeAt
 
     if runtimeGuid > 0 and runtimeEntry > 0 and BossStatusIndicatesActive(runtimeStatus) then
         currentActiveBossGUID = runtimeGuid
@@ -4401,6 +4776,23 @@ end
 
 local function ScheduleBossRespawn(instanceId, sourceContext)
     CancelRespawnTimer()
+
+    -- 定时启停：不在时间段内就干脆不排重生（排了也会在进入下一个时间段前被清掉），
+    -- 等 tick 判断"进入时间段"时统一生成。
+    if IsBossScheduleClosed(BossNow()) then
+        PersistBossRuntime(sourceContext, {
+            boss_guid = 0,
+            status = "cooldown",
+            phase = 0,
+            respawn_at = 0,
+        })
+        InsertBossEvent(sourceContext, "respawn_deferred", "定时计划不在时间段内，Boss 重生推迟到下一个时间段。", "", 0, {
+            instance_id = tonumber(instanceId or 0) or 0,
+        })
+        print(" [定时启停]不在时间段内，本次不安排重生（进入时间段后自动生成）。")
+        return
+    end
+
     local respawnMilliseconds = BOSS_CONFIG.respawnTimeMinutes * 60 * 1000
     local respawnAt = BossNow() + (BOSS_CONFIG.respawnTimeMinutes * 60)
     PersistBossRuntime(sourceContext, {
@@ -4419,6 +4811,169 @@ local function ScheduleBossRespawn(instanceId, sourceContext)
         respawnTimerEventId = nil
     end, respawnMilliseconds, 1)
     print(" [调试信息]Boss重生定时器已安排: " .. BOSS_CONFIG.respawnTimeMinutes .. " 分钟后")
+end
+
+-- ============================================================================
+--  §10.1 定时启停 tick（到点自动开始 / 结束）
+-- ----------------------------------------------------------------------------
+--  每秒跑一次，但只在「计划状态翻转」时动手：
+--    进入时间段 → 写一条 schedule_open 事件，并在没有活跃 Boss / 没有待触发重生计时时补生成一只
+--    离开时间段 → 取消待重生计时，并按 [schedule].scheduleClearOnClose 决定是否清理活跃 Boss
+--  计划未启用时第一轮只把运行态标成 off，之后空转（面板"运行状态"据此显示"未启用"）。
+--
+--  为什么快照式落库：tick 每秒一次，不能每次都写库 —— 只有当
+--  「状态 / 命中段 / 下次切换的绝对时刻」这个签名变化时才 REPLACE 一次。
+-- ============================================================================
+local ResetActiveBossState, ApplyBossScheduleTick, BossScheduleTickIntervalMs
+do
+    local SCHEDULE_TICK_MS = 1000
+    local SCHEDULE_SPAWN_RETRY_SECONDS = 30
+    local status = {active = nil, signature = nil, window = "", nextChangeAt = 0, lastSpawnAttemptAt = 0}
+
+    -- 与 `.boss clear` 完全同一套清理：移除世界里的活跃 Boss、复位运行时记录（不发奖励）
+    ResetActiveBossState = function(eventType, eventNote, actorName, actorGuid, payload)
+        local target = nil
+        if IsUnitValid(activeBossCreature) and IsManagedBossEntry(activeBossCreature:GetEntry()) then
+            target = activeBossCreature
+        elseif activeBossInfo then
+            target = TryGetCreatureByGUID(activeBossInfo.guid, activeBossInfo.entry, activeBossInfo.mapId, activeBossInfo.instanceId)
+        end
+
+        local clearedGuid = activeBossInfo and tonumber(activeBossInfo.guid or 0) or 0
+        local despawned = IsUnitValid(target)
+
+        -- 先写事件（此时 activeBossInfo 还在，事件里能记下被清理的是哪个 Boss），再清理内存状态
+        payload = payload or {}
+        payload.cleared_guid = clearedGuid
+        payload.despawned = despawned and 1 or 0
+        InsertBossEvent(nil, eventType, eventNote, actorName or "", actorGuid or 0, payload)
+
+        CancelRespawnTimer()
+
+        if despawned then
+            if target.RemoveEvents then
+                target:RemoveEvents()
+            end
+            pcall(function() target:DespawnOrUnsummon(0) end)
+        end
+
+        bossAIStates[clearedGuid] = nil
+        bossAllySpawned[clearedGuid] = nil
+        bossTraitsApplied[clearedGuid] = nil
+        bossBaseMaxHealth[clearedGuid] = nil
+        bossAppliedAuras[clearedGuid] = nil
+        bossRewardedGUIDs[clearedGuid] = nil
+        bossThreatSnapshots[clearedGuid] = nil
+        bossContributionStats[clearedGuid] = nil
+        scriptSpawnedBossGUIDs[clearedGuid] = nil
+
+        ClearActiveBoss()
+        PersistBossRuntime(nil, {
+            boss_guid = 0,
+            boss_entry = 0,
+            boss_name = "",
+            map_id = 0,
+            instance_id = 0,
+            home_x = 0,
+            home_y = 0,
+            home_z = 0,
+            status = "idle",
+            phase = 0,
+            respawn_at = 0,
+            last_reset_at = BossNow(),
+        })
+
+        return clearedGuid, despawned
+    end
+
+    ApplyBossScheduleTick = function(event, delay, calls)
+        if BOSS_CONFIG.scheduleEnabled ~= true then
+            if status.signature ~= "off" then
+                status.active = nil
+                status.signature = "off"
+                status.window = ""
+                status.nextChangeAt = 0
+                PersistBossRuntime(nil, {schedule_state = "off", schedule_window = "", schedule_next_change_at = 0})
+            end
+            return
+        end
+
+        local t = BossNow()
+        local list = GetBossScheduleWindows()
+        local active, hit = BossScheduleActiveAt(t, list)
+        local nextChange = BossScheduleNextChange(t, list)
+        local nextChangeAt = (nextChange > 0) and (t + nextChange) or 0
+        local state = (#list == 0) and "empty" or (active and "open" or "closed")
+        local window = hit and hit.text or ""
+        local signature = string.format("%s|%s|%d", state, window, nextChangeAt)
+        local previous = status.active
+
+        if status.signature ~= signature then
+            status.signature = signature
+            status.window = window
+            status.nextChangeAt = nextChangeAt
+            PersistBossRuntime(nil, {
+                schedule_state = state,
+                schedule_window = window,
+                schedule_next_change_at = nextChangeAt,
+            })
+        end
+        status.active = active
+
+        -- 已启用但没写有效时间段：明确不自动开关（否则"填错一次"就会把线上 Boss 清空）
+        if #list == 0 then
+            return
+        end
+
+        if active then
+            if previous ~= true then
+                InsertBossEvent(nil, "schedule_open", "定时计划进入时间段，Boss 活动自动开启。", "", 0, {
+                    window = window,
+                    next_change_at = nextChangeAt,
+                })
+                print(string.format(" [定时启停]进入时间段「%s」，Boss 活动自动开启。", window))
+            end
+
+            -- 时段内没有活跃 Boss（且没有待触发的重生计时）就补一只；生成失败 30 秒后才重试
+            if respawnTimerEventId == nil and not HasActiveBoss()
+                and (t - (status.lastSpawnAttemptAt or 0)) >= SCHEDULE_SPAWN_RETRY_SECONDS then
+                status.lastSpawnAttemptAt = t
+                SpawnRandomBoss(0)
+            end
+            return
+        end
+
+        -- 不在时间段内。真正"从时段内掉出来"才写事件；服务器刚启动就已在时段外时只做静默收敛。
+        CancelRespawnTimer()
+
+        local hasResidual = HasActiveBoss()
+            or activeBossInfo ~= nil
+            or BossStatusIndicatesActive(bossRuntimeState.status)
+
+        if BOSS_CONFIG.scheduleClearOnClose and hasResidual then
+            local clearedGuid, despawned = ResetActiveBossState(
+                previous == true and "schedule_close" or "schedule_clear",
+                previous == true
+                    and "定时计划离开时间段，Boss 活动已结束。"
+                    or "不在定时计划的时间段内，已清理活跃 Boss。",
+                "", 0, {window = window})
+            print(string.format(" [定时启停]不在时间段内，已清理活跃 Boss（GUID %d，%s）。",
+                clearedGuid, despawned and "已从世界移除" or "世界中已不存在"))
+        elseif previous == true then
+            InsertBossEvent(nil, "schedule_close",
+                BOSS_CONFIG.scheduleClearOnClose
+                    and "定时计划离开时间段，Boss 活动已结束。"
+                    or "定时计划离开时间段，Boss 活动已结束（按配置保留当前 Boss）。",
+                "", 0, {
+                    window = window,
+                    next_change_at = nextChangeAt,
+                })
+            print(" [定时启停]离开时间段，Boss 活动已结束。")
+        end
+    end
+
+    -- 注册在文件末尾统一做（这里只把间隔暴露出去）
+    BossScheduleTickIntervalMs = SCHEDULE_TICK_MS
 end
 
 -- ========== 事件处理 ==========
@@ -4899,6 +5454,8 @@ local function OnBossCommand(event, player, command, chatHandler)
         BossSendMessage(player, chatHandler, "9. .boss rebase 按模板重算基准血量再套用倍率（需脱战）。")
         BossSendMessage(player, chatHandler, "10. .boss kill 击杀当前活跃Boss（走正常死亡与奖励流程）。")
         BossSendMessage(player, chatHandler, "11. .boss clear 直接移除当前活跃Boss并复位运行时记录（不发奖励）。")
+        BossSendMessage(player, chatHandler, "12. .boss schedule 查看定时启停计划与当前是否在时间段内。")
+        BossSendMessage(player, chatHandler, "13. .boss spawn force 定时计划在时段外时强制生成一只（调试用）。")
         BossSendMessage(player, chatHandler, "当前Boss: " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].name or "")
             .. " (Entry " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].entry or 0) .. ")")
         BossSendMessage(player, chatHandler, "当前技能池: " .. GetCurrentSkillPresetLabel())
@@ -5081,68 +5638,41 @@ local function OnBossCommand(event, player, command, chatHandler)
         return false
     end
 
+    if action == "schedule" then
+        -- 定时启停的当前状态（面板「扩展配置 → 定时启停」里设置）
+        BossReply(player, chatHandler, true, BossScheduleSummaryLine(BossNow()))
+        BossSendMessage(player, chatHandler, "写法示例: 08:00-09:00 / 1-5@20:00-23:00 / 6,7@10:00-12:00 / 跨夜 22:00-02:00（多段用 ; 分隔）")
+        BossSendMessage(player, chatHandler, "计划开启时定时优先于手动开关：时段到点自动生成，离开时段按配置自动清理当前活跃 Boss。")
+        return false
+    end
+
     if action == "clear" or action == "despawn" then
         -- 清理活跃 Boss：直接移除、不发奖励、复位运行时记录（面板「重置」按钮）
-        local target = nil
-        if IsUnitValid(activeBossCreature) and IsManagedBossEntry(activeBossCreature:GetEntry()) then
-            target = activeBossCreature
-        elseif activeBossInfo then
-            target = TryGetCreatureByGUID(activeBossInfo.guid, activeBossInfo.entry, activeBossInfo.mapId, activeBossInfo.instanceId)
-        end
+        -- 与定时启停 tick 共用同一套清理（ResetActiveBossState），避免两处行为漂移。
+        local clearedGuid, despawned = ResetActiveBossState(
+            "command_clear", "GM 已清理活跃 Boss 并复位运行时记录。", actorName, actorGuid)
 
-        local clearedGuid = activeBossInfo and tonumber(activeBossInfo.guid or 0) or 0
-        local despawned = IsUnitValid(target)
-
-        -- 先写事件（此时 activeBossInfo 还在，事件里能记下被清理的是哪个 Boss），再清理内存状态
-        InsertBossEvent(nil, "command_clear", "GM 已清理活跃 Boss 并复位运行时记录。", actorName, actorGuid, {
-            cleared_guid = clearedGuid,
-            despawned = despawned and 1 or 0,
-        })
-
-        CancelRespawnTimer()
-
-        if despawned then
-            if target.RemoveEvents then
-                target:RemoveEvents()
-            end
-            pcall(function() target:DespawnOrUnsummon(0) end)
-        end
-
-        bossAIStates[clearedGuid] = nil
-        bossAllySpawned[clearedGuid] = nil
-        bossTraitsApplied[clearedGuid] = nil
-        bossBaseMaxHealth[clearedGuid] = nil
-        bossAppliedAuras[clearedGuid] = nil
-        bossRewardedGUIDs[clearedGuid] = nil
-        bossThreatSnapshots[clearedGuid] = nil
-        bossContributionStats[clearedGuid] = nil
-        scriptSpawnedBossGUIDs[clearedGuid] = nil
-
-        ClearActiveBoss()
-        PersistBossRuntime(nil, {
-            boss_guid = 0,
-            boss_entry = 0,
-            boss_name = "",
-            map_id = 0,
-            instance_id = 0,
-            home_x = 0,
-            home_y = 0,
-            home_z = 0,
-            status = "idle",
-            phase = 0,
-            respawn_at = 0,
-            last_reset_at = BossNow(),
-        })
-
-        BossReply(player, chatHandler, true, string.format(
+        local replyText = string.format(
             "已清理活跃 Boss（GUID %d，%s）并复位运行时记录。",
             clearedGuid,
-            despawned and "已从世界移除" or "世界中已不存在"))
+            despawned and "已从世界移除" or "世界中已不存在")
+        if BOSS_CONFIG.scheduleEnabled == true and not IsBossScheduleClosed(BossNow()) then
+            replyText = replyText .. " 注意：定时计划正在时间段内，脚本会在 1 秒内自动补生成一只。"
+        end
+        BossReply(player, chatHandler, true, replyText)
         return false
     end
 
     if action ~= nil and action ~= "" and action ~= "spawn" then
-        BossReply(player, chatHandler, false, "未知的 .boss 子命令（可用: spawn / help / config reload / config show / preset / difficulty / rebase / kill / clear）。")
+        BossReply(player, chatHandler, false, "未知的 .boss 子命令（可用: spawn / help / config reload / config show / preset / difficulty / rebase / kill / clear / schedule）。")
+        return false
+    end
+
+    -- 定时启停门控：计划启用且在时段外时拒绝生成（.boss spawn force 可临时绕过，供调试）
+    if BOSS_CONFIG.scheduleEnabled == true and parts[3] ~= "force" and IsBossScheduleClosed(BossNow()) then
+        BossReply(player, chatHandler, false,
+            "定时启停已启用，当前不在时间段内，已拒绝生成。"
+            .. "如需临时生成请用 .boss spawn force；要改时间段请到 AGMP 面板「扩展配置 → 定时启停」（.boss schedule 可看计划）。")
         return false
     end
 
@@ -5257,3 +5787,7 @@ RegisterBossEventsForCandidates()
 
 RegisterPlayerEvent(42, OnBossCommand)
 RegisterPlayerEvent(65, OnBossFightPlayerHeal)
+
+-- 定时启停 tick：每秒一次、永久重复（CreateLuaEvent 的 repeats=0 表示无限）。
+-- 它自己只在计划状态翻转时动手，未启用计划时第一轮标一次 off 就空转。
+CreateLuaEvent(ApplyBossScheduleTick, BossScheduleTickIntervalMs, 0)

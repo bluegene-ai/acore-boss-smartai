@@ -6,6 +6,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 - 智能战斗 AI、多套技能池预设与技能节奏档位。
 - **可切换的强度档位**，由专用 `creature_template` 承载（见下）。
+- **定时启停**：按每天的时间段自动开始/结束活动 Boss（面板「扩展配置 → 定时启停」），见下。
 - **配置全部落库**：脚本里只保留默认值，运行期以 `ac_eluna` 为准（见下「配置在哪里改」）。
 - 运行时数据落在 `ac_eluna`：`boss_activity_runtime`、`boss_activity_config`、
   `boss_activity_config_ext`、`boss_activity_events`、`boss_activity_contributors`。
@@ -15,12 +16,14 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 | 命令 | 作用 |
 |---|---|
-| `.boss` / `.boss spawn` | 在配置刷新点生成 Boss |
+| `.boss` / `.boss spawn` | 在配置刷新点生成 Boss（定时计划在时段外时会被拒绝） |
+| `.boss spawn force` | 忽略定时计划强制生成一只（调试用） |
+| `.boss schedule` | 查看定时启停计划、当前是否在时间段内、距下次切换多久 |
 | `.boss kill` | 击杀当前活跃 Boss（走正常死亡与奖励流程） |
 | `.boss clear`（别名 `.boss despawn`） | 直接移除活跃 Boss、不发奖励并复位运行时记录 |
 | `.boss rebase` | 按模板重算基准血量再套用倍率（**仅脱战可用**） |
 | `.boss config reload` | 从 `ac_eluna` 热加载配置（AGMP 保存后自动调用） |
-| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 16 个分组） |
+| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 17 个分组） |
 | `.boss preset list` / `.boss preset <key>` | 查看 / 切换技能池预设 |
 | `.boss difficulty list` / `.boss difficulty <key>` | 查看 / 切换技能节奏档位 |
 | `.boss help` | 帮助 |
@@ -43,7 +46,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 | 表 | 内容 | 谁写 |
 |---|---|---|
 | `boss_activity_config` | Boss 身份、等级/体型/血量倍率、光环、友方援军、刷新点、技能池、奖励 | AGMP 面板（`REPLACE INTO` 整行重写）+ Lua |
-| `boss_activity_config_ext` | 喊话、战斗嘲讽（12 组文本）、AI 节奏、战斗阶段阈值、巡逻、小怪 AI、援军模板、职业类型与职业奖励池、受管模板 | Lua 建表/引导 + AGMP 面板（`INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列） |
+| `boss_activity_config_ext` | 喊话、战斗嘲讽（12 组文本）、AI 节奏、战斗阶段阈值、巡逻、小怪 AI、援军模板、职业类型与职业奖励池、受管模板、**定时启停** | Lua 建表/引导 + AGMP 面板（`INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列） |
 
 为什么拆两张表：AGMP 保存主表时用 `REPLACE INTO` 重写整行，凡不在它列清单里的列
 都会被重置为建表默认值，脚本私有配置放主表会被面板保存清掉，所以单独一张表；
@@ -60,12 +63,49 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 配置项的取值类型（`kind`）：`int` / `bool` / `scaled`（小数 ×100 存 INT）/ `text` /
 `text_keep` / `intlist` / `lines` / `keyedlines` / `keyedword` / `keyedintlist` / `spawnpoints`。
+（面板侧多一个 `schedule_windows`：每天时间段，保存前由 `Domain\Support\ScheduleWindows` 校验并归一化。）
 
 ### 仍然写在脚本里的东西（不是配置项）
 
 - 技能池预设 / 强度档位系数 / 打断法术池（§5 内容库）：属于「技能内容」，改动等于改战斗设计，随版本发布；
   可调的部分（选哪套预设、哪个档位）已经落库。
 - 显示用文本（职业中文名等）、小怪召唤的散布半径、技能条件里的个别常量：属于逻辑常量，不是调参项。
+
+## 定时启停（每天的时间段）
+
+让活动 Boss 只在设定的时间段里进行：**进入时间段自动生成一只，离开时间段停掉待重生计时**（默认还会清理当时活跃的 Boss）。
+
+配置在 `boss_activity_config_ext`（AGMP 面板「扩展配置 → 定时启停」）：
+
+| 列 | 默认 | 说明 |
+|---|---|---|
+| `activity_schedule_enabled` | `0` | 是否按时间段自动开关 |
+| `activity_schedule_windows` | `''` | 时间段文本，语法见下 |
+| `activity_schedule_clear_on_close` | `1` | 离开时间段时是否清理当前活跃 Boss（`0` = 只停新刷新，已生成的打到死为止） |
+
+时间段写法（与 AGMP 的 `app/Domain/Support/ScheduleWindows.php` 完全一致，改一边必须改另一边）：
+
+```
+08:00-09:00                  每天 08:00-09:00
+08:00-09:00; 20:00-22:00     多段用分号（段里没有 @ 时逗号也能分段）
+1-5@20:00-23:00              周一至周五（1=周一 … 7=周日，也认 mon-fri 与 一/日）
+6,7@10:00-12:00              周六、周日
+22:00-02:00                  跨夜（到次日凌晨 2 点）
+```
+
+行为约定：
+
+- **计划优先于手动开关**：计划启用且在时段外时，`.boss spawn` 会被拒绝并提示（`.boss spawn force` 可临时绕过，供调试）；
+  时段内没有活跃 Boss 且没有待触发的重生计时，tick 会补生成一只（生成失败 30 秒后重试）。
+- 启用但时间段为空/写错 = **永不自动开关**（不会因为"填错一次"就把线上 Boss 清空），非法片段只写一行日志并跳过。
+- 被杀死的 Boss 仍按 `respawn_time_minutes` 重生；若重生时刻已落在时段外，本次不再排程，等下一个时间段。
+- 用 `.boss schedule` 看计划与当前状态；运行态（`off/empty/open/closed`、命中段、下次切换时刻）会写进
+  `boss_activity_runtime` 的 `schedule_state` / `schedule_window` / `schedule_next_change_at`，
+  AGMP 的「运行状态」卡片直接显示脚本上报的状态。
+- 计时用服务器本地时间（`os.date`），全天时间段与跨夜段都按**段开始那天**判断星期。
+
+面板侧的时间段解析类 `Acme\Panel\Domain\Support\ScheduleWindows` 由聊天答题与活动 Boss 共用：
+面板负责"保存前校验并归一化 + 给出人话的报错"，到点开关全部由 Lua 的 tick 执行。
 
 ## 难度档位
 
@@ -102,7 +142,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 ## 不启动服务器也能测
 
-`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 75 项不变量：加载流程、两张配置表的 SQL 构造、扩展表建表/写入列一致性、命令标记、`.boss config show` 输出、「数据库值确实覆盖脚本默认值」、`.boss clear` 副作用、事件注册、**多区绑定（改写常量后所有 SQL 必须跟着换库名/state_key）**，以及上面两处回归（"未覆盖全局 print"、"未泄漏全局变量"）。用法见 `tools/boss-lua-smoke/README.md`。
+`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 90+ 项不变量：加载流程、两张配置表的 SQL 构造、扩展表建表/写入列一致性、命令标记、`.boss config show` 输出、「数据库值确实覆盖脚本默认值」、`.boss clear` 副作用、事件注册、**定时启停（用可控时钟驱动每秒 tick：星期掩码、时段内补生成、离开时段写 `schedule_close`、时段外拒绝 `.boss spawn` 而 `force` 放行，以及老库自动补列）**、**多区绑定（改写常量后所有 SQL 必须跟着换库名/state_key）**，以及两处回归（"未覆盖全局 print"、"未泄漏全局变量"）。用法见 `tools/boss-lua-smoke/README.md`。
 
 ```
 lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
