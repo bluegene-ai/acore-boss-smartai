@@ -2,26 +2,29 @@
 #  deploy-realm.ps1 — 把 boss.lua 部署到某个区（多区部署标准步骤）
 # ----------------------------------------------------------------------------
 #  多区（多个 realm 共用一套 auth）时，每个区各跑一份 worldserver + 一份 boss.lua，
-#  活动 Boss 的配置/运行态/事件/贡献必须落在**各自的库**里。各区之间唯一的差别就是
-#  boss.lua §2 的两行常量（BOSS_DB_NAME / BOSS_RUNTIME_KEY），本脚本负责：
+#  但**共用同一个数据库**（默认 ac_eluna），靠 state_key 把各区数据分租。
+#  所以各区之间唯一的差别就是 boss.lua §2 里的那一个 key（BOSS_RUNTIME_KEY +
+#  BOSS_CONFIG_KEY，两行必须相同）。本脚本负责：
 #
-#    1. 从仓库取 boss.lua，改写这两行常量 → 写入 <RealmRoot>\lua_scripts\boss.lua
+#    1. 从仓库取 boss.lua，改写 §2 的本区 key → 写入 <RealmRoot>\lua_scripts\boss.lua
+#       （-DbName 只在你要给某个区单独一个库时才需要给；默认 ac_eluna，不改库名）
 #    2. 写入前自动备份原文件（boss.lua.<时间戳>.bak）
-#    3. 可选：语法检查（-LuaExe）与导入难度档位 SQL（-ApplyTierSql <world 库>）
+#    3. 可选：语法检查（-LuaExe）与导入难度档位 SQL（-ApplyTierSql <world 库>）；
+#       导入前会把 SQL 里写死的库名**与本区 key** 一起改写，避免动到别的区的配置
 #    4. 打印 AGMP 面板 config/boss.php 需要同步的 server_overrides 片段
 #
 #  用法：
-#    # 先干跑看改动，不写任何文件
-#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna -DryRun
-#    # 真部署
-#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna
+#    # 主区（从单区升级上来）：key 保持 current，不改库名
+#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-a>
+#    # 第二个区：必须给它一个自己的 key（不能是 current，否则和主区共用一份数据）
+#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b>
 #    # 连难度档位模板一起导进该区的 world 库
-#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna `
-#        -ApplyTierSql <that realm's world DB>
+#    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b> `
+#        -ApplyTierSql <该区 world 库>
 #
 #  部署完记得：
 #    · 让该区 worldserver 重新加载 Eluna 脚本（游戏内 .reload ale，或重启该区）
-#    · 面板 config/boss.php 的 server_overrides 加上该区（脚本会打印片段）
+#    · 面板 config/generated/boss.php 的 server_overrides 加上该区（脚本会打印片段）
 # ============================================================================
 
 [CmdletBinding()]
@@ -29,10 +32,11 @@ param(
     # 该区的 worldserver 根目录（里面应有 lua_scripts\ 与 worldserver.exe），例如 D:\AzerothCore\release\<realm-b>
     [Parameter(Mandatory = $true)][string]$RealmRoot,
 
-    # 该区 boss.lua 使用的库名，必须与面板 server_overrides 的 custom_db_name 一致
-    [Parameter(Mandatory = $true)][string]$DbName,
+    # 数据库名；多区共用库时保持默认 ac_eluna 即可（只有想给该区单独一个库时才改）
+    [string]$DbName = 'ac_eluna',
 
-    # 配置表/运行态的 state_key；只有两个区共用一个库时才需要区分（不推荐）
+    # ★ 本区的 state_key：主区用 current（历史数据默认值），其它区各给一个不同的值
+    #   （建议用面板区服索引或 RealmID，如 "1"/"2"）。两个区用同一个 key = 共用一份数据。
     [string]$RuntimeKey = 'current',
 
     # 源文件；默认取本仓库根目录的 boss.lua
@@ -96,9 +100,11 @@ Write-Step "改写 §2 本区绑定"
 
 $dbPattern = '(local BOSS_DB_NAME\s*=\s*")[^"]*(")'
 $keyPattern = '(local BOSS_RUNTIME_KEY\s*=\s*")[^"]*(")'
+$configKeyPattern = '(local BOSS_CONFIG_KEY\s*=\s*")[^"]*(")'
 
 $dbMatches = [regex]::Matches($sourceText, $dbPattern)
 $keyMatches = [regex]::Matches($sourceText, $keyPattern)
+$configKeyMatches = [regex]::Matches($sourceText, $configKeyPattern)
 
 if ($dbMatches.Count -ne 1) {
     throw "在 boss.lua 里匹配到 $($dbMatches.Count) 处 BOSS_DB_NAME 赋值（应为 1 处）；常量位置变了，请同步本脚本与 smoke.lua。"
@@ -106,18 +112,23 @@ if ($dbMatches.Count -ne 1) {
 if ($keyMatches.Count -ne 1) {
     throw "在 boss.lua 里匹配到 $($keyMatches.Count) 处 BOSS_RUNTIME_KEY 赋值（应为 1 处）；常量位置变了，请同步本脚本与 smoke.lua。"
 }
+if ($configKeyMatches.Count -ne 1) {
+    throw "在 boss.lua 里匹配到 $($configKeyMatches.Count) 处 BOSS_CONFIG_KEY 赋值（应为 1 处）；常量位置变了，请同步本脚本与 smoke.lua。"
+}
 
-$newDbLine = 'local BOSS_DB_NAME = "' + $DbName + '"'
-$newKeyLine = 'local BOSS_RUNTIME_KEY = "' + $RuntimeKey + '"'
+Write-Detail ("库名     : " + $dbMatches[0].Value.Trim() + "  →  local BOSS_DB_NAME = `"$DbName`"")
+Write-Detail ("本区 key : " + $keyMatches[0].Value.Trim() + "  →  local BOSS_RUNTIME_KEY = `"$RuntimeKey`"")
+Write-Detail ("配置 key : " + $configKeyMatches[0].Value.Trim() + "  →  local BOSS_CONFIG_KEY = `"$RuntimeKey`"")
 
-Write-Detail ("旧: " + $dbMatches[0].Value.Trim())
-Write-Detail ("新: " + $newDbLine)
-Write-Detail ("旧: " + $keyMatches[0].Value.Trim())
-Write-Detail ("新: " + $newKeyLine)
+if ($RuntimeKey -eq 'current' -and $DbName -eq 'ac_eluna') {
+    Write-Host "   [注意] key 仍是 current：只有『主区』（从单区升级上来的那个区）可以这样。" -ForegroundColor Yellow
+    Write-Host "          其它区必须各给一个不同的 -RuntimeKey，否则两个区共用同一份配置/运行态/事件。" -ForegroundColor Yellow
+}
 
 # 保留原有换行符（仓库里是 CRLF，原样带过去）
 $newText = [regex]::Replace($sourceText, $dbPattern, ('${1}' + $DbName + '${2}'), 1)
 $newText = [regex]::Replace($newText, $keyPattern, ('${1}' + $RuntimeKey + '${2}'), 1)
+$newText = [regex]::Replace($newText, $configKeyPattern, ('${1}' + $RuntimeKey + '${2}'), 1)
 
 $sourceBytes = [System.IO.File]::ReadAllBytes($Source)
 $hasBom = ($sourceBytes.Length -ge 3 -and $sourceBytes[0] -eq 0xEF -and $sourceBytes[1] -eq 0xBB -and $sourceBytes[2] -eq 0xBF)
@@ -175,12 +186,15 @@ if ($ApplyTierSql -ne '') {
     }
 
     # 该文件的 creature_template 部分作用在默认库（= -ApplyTierSql），但末尾那次
-    # `ac_eluna`.`boss_activity_config` 切换写死了 80 区的库名 —— 部署到别的区时必须
-    # 先改写，否则会去改 80 区的活动配置。
+    # `ac_eluna`.`boss_activity_config` 切换既写死了库名、也用 `state_key = 'current'`
+    # 选中「主区」那一行 —— 多区共用库时两个都要改写，否则会去改主区的活动配置。
     $tierText = [System.IO.File]::ReadAllText($tierSql)
     $schemaHits = ([regex]::Matches($tierText, '`ac_eluna`')).Count
+    $keyHits = ([regex]::Matches($tierText, "state_key`` = 'current'")).Count
     $tierForRealm = $tierText -replace '`ac_eluna`', ('`' + $DbName + '`')
-    Write-Detail "SQL 内写死的 ``ac_eluna`` 引用: $schemaHits 处 → 改写为 ``$DbName``"
+    $tierForRealm = $tierForRealm -replace "state_key`` = 'current'", ("state_key`` = '" + $RuntimeKey + "'")
+    Write-Detail "SQL 内写死的库名 ``ac_eluna``: $schemaHits 处 → ``$DbName``"
+    Write-Detail "SQL 内写死的本区 key 'current': $keyHits 处 → '$RuntimeKey'"
 
     if ($DryRun) {
         Write-Detail "DryRun：将执行 mysql < 改写后的 SQL（库 $ApplyTierSql）"
@@ -209,16 +223,17 @@ if ($ApplyTierSql -ne '') {
 }
 
 # --------------------------------------------------------- 面板需要同步的片段
-Write-Step 'AGMP 面板需要同步的配置（config/boss.php → server_overrides）'
+Write-Step 'AGMP 面板需要同步的配置（config/generated/boss.php → server_overrides）'
 Write-Host @"
    <该区的 server 索引> => [
        'custom_db_name' => '$DbName',
-       'runtime_key'   => '$RuntimeKey',
+       'runtime_key'   => '$RuntimeKey',   // 必须与该区 boss.lua §2 的 key 相同
    ],
 "@
 Write-Host ''
 Write-Step '收尾'
 Write-Detail '让该区 worldserver 重新加载 Eluna 脚本：游戏内 .reload ale（或重启该区）'
-Write-Detail "确认绑定：该区 lua_scripts\lua_logs\boss.log 里应出现 [BOSS] 本区绑定: db=$DbName"
-Write-Detail '确认没串区：面板「Boss 活动管理」页头显示的库名应与上面一致'
+Write-Detail "确认绑定：该区 lua_scripts\lua_logs\boss.log 里应出现 [BOSS] 本区绑定: db=$DbName configKey=$RuntimeKey runtimeKey=$RuntimeKey"
+Write-Detail '确认没串区：面板「Boss 活动管理」页头显示的 state_key 应与上面一致'
+Write-Detail '★ 每个区的 key 必须不同：两个区用同一个 key 就是共用同一份配置/运行态/事件'
 Write-Step '完成'

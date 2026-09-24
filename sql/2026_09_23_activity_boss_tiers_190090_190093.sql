@@ -1,12 +1,13 @@
 -- ============================================================================
 --  活动 Boss 专用模板（AGMP「Boss 活动管理」→ 难度档位）
 --  文件：2026_09_23_activity_boss_tiers_190090_190093.sql
---  目标库：该区自己的 world 库（如 acore_world；多区时每个区一个）
---          末尾另含一次配置切换，写的是 `ac_eluna`
+--  目标库：该区的 world 库（如 acore_world；多区时每个区一个）
+--          末尾另含一次配置切换：共用库 `ac_eluna` + 主区 key `current`
 --
---  ★ 多区注意：本文件末尾的 UPDATE 直接写了 `ac_eluna`（80 区的库名）。把本文件用在别的区
---    时，必须先把那个库名换成该区自己的库（如 `<该区库>`），否则会去改默认区的活动配置。
---    正确做法：用 tools/deploy-realm.ps1 -ApplyTierSql <该区 world 库>，它会按 -DbName 改写后再导入。
+--  ★ 多区注意：本文件末尾的 UPDATE 写死了 `ac_eluna`（共用库名）**和** `state_key = 'current'`
+--    （主区那一行）。用在别的区时，必须把后者换成该区的 key，否则会去改主区的活动配置；
+--    库名一般不用改（多区共用 ac_eluna）。正确做法：用 tools/deploy-realm.ps1
+--    -ApplyTierSql <该区 world 库> -RuntimeKey <该区 key>，它会自动改写这两处后再导入。
 --
 --  为什么需要这个文件：
 --    * 旧实现复用死亡矿井 Boss「绿皮队长」(entry 647)：该模板 AIName=SmartAI 且

@@ -126,39 +126,45 @@ lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
 
 ## 多区部署（多个 realm 共用一套 auth）
 
-一台机器上跑多个区时，**每个区各跑一份 worldserver + 一份 `boss.lua`**，活动 Boss 的配置、
-运行态、事件、贡献必须落在**各自的库**里：否则两个区会互相覆盖活动配置，面板上的表现是
-"改了没生效"或"看到的是别的区的 Boss"（事件/贡献表没有 `state_key` 列，共库时必然串在一起）。
+一台机器上跑多个区时，**每个区各跑一份 worldserver + 一份 `boss.lua`**，但**共用同一个数据库**
+（默认 `ac_eluna`），靠 `state_key` 把各区数据分租 —— **不需要为每个区建库**。四张表都按这个 key 区分：
 
-各区之间 `boss.lua` 的唯一差别是 §2 的两行：
+| 表 | 分租方式 |
+|---|---|
+| `boss_activity_config` / `boss_activity_config_ext` / `boss_activity_runtime` | `state_key` 就是主键 |
+| `boss_activity_events` / `boss_activity_contributors` | 有 `state_key` 列（老库由 `boss.lua` 自动补列 + 建索引） |
+
+所以各区之间 `boss.lua` 的唯一差别是 §2 里的那**一个 key**（两行必须相同）：
 
 ```lua
-local BOSS_DB_NAME = "ac_eluna"       -- 默认库名（历史部署保持不变）
-local BOSS_RUNTIME_KEY = "current"    -- 各区都用 current；只有共库时才需要不同
+local BOSS_DB_NAME = "ac_eluna"       -- 共用库，一般不动
+local BOSS_RUNTIME_KEY = "current"    -- 本区 key：运行态/事件/贡献
+local BOSS_CONFIG_KEY = "current"     -- 本区 key：配置表（必须与上一行相同）
 ```
 
-| 区 | worldserver 目录 | `BOSS_DB_NAME` | 面板 `server_overrides[<索引>].custom_db_name` |
+| 区 | worldserver 目录 | key（两行相同） | 面板 `server_overrides[<索引>].runtime_key` |
 |---|---|---|---|
-| 默认/第一个区 | `D:\AzerothCore\release\<realm-a>` | `ac_eluna`（脚本内置默认，不改） | 与左侧一致（通常不必写 override） |
-| 第二个区 | `D:\AzerothCore\release\<realm-b>` | `<realm-b>-eluna` | 与左侧一致 |
-| 第三个区 | … | `<realm-c>-eluna` | 与左侧一致 |
+| 主区（从单区升级上来的） | `D:\AzerothCore\release\<realm-a>` | `current`（保持不动 → 历史行按默认值自动归它，**零迁移**） | `current` |
+| 第二个区 | `D:\AzerothCore\release\<realm-b>` | `<realm-b>` | `<realm-b>` |
+| 第三个区 | … | `<realm-c>` | `<realm-c>` |
 
-用 `tools/deploy-realm.ps1` 部署（自动改写常量 + 备份原文件 + 语法检查 + 打印面板片段）：
+**两个区用同一个 key 就等于共用同一份配置/运行态/事件**，部署时务必给每个区一个不同的 key。
+
+用 `tools/deploy-realm.ps1` 部署（自动改写 key + 备份原文件 + 语法检查 + 打印面板片段）：
 
 ```powershell
 # 先干跑看改动
-pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna -DryRun
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b> -DryRun
 # 真部署（顺带导入难度档位模板到该区的 world 库）
-pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna `
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b> `
     -LuaExe <lua.exe> -ApplyTierSql <该区 world 库> -DbPassword <pw>
 ```
 
-新区第一次启动时 `boss.lua` 会自建库与四张表（`CREATE DATABASE IF NOT EXISTS` +
-`CREATE TABLE IF NOT EXISTS`）并写入默认值；想让新区沿用老区的活动配置，可在老库导出
-`boss_activity_config` / `boss_activity_config_ext` 两行、改库名后导入新区库。
+新区的配置第一次加载时由 `boss.lua` 用该 key 写入一份默认值（`INSERT IGNORE`）；想让新区沿用
+老区的活动配置，可导出老区那一行（`WHERE state_key = '<老区 key>'`）、把 key 改成新区的再导入。
 
-`tools/boss-lua-smoke/smoke.lua` 会断言这件事：把 §2 常量改写后重新加载，所有引用库名的 SQL
-都必须跟着换成新库名、`state_key` 也必须跟着换，任何一处写死的 `ac_eluna` 都会让测试失败。
+`tools/boss-lua-smoke/smoke.lua` 会断言这件事：把 §2 的 key 改写后重新加载，事件/贡献的写入必须
+带新的 key、启动日志必须报出新 key、四张表的库名仍是共用库；任何一处写死的 `'current'` 都会失败。
 
 ## 独立运行（不接 Web）
 

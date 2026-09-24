@@ -134,44 +134,49 @@ lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
 
 ## Multi-realm deployment (several realms sharing one auth database)
 
-Each realm runs its own `worldserver` **and its own copy of `boss.lua`**, and the boss activity
-config, runtime state, events and contributor snapshots must live in **that realm's own schema**.
-Sharing one schema between realms makes them overwrite each other's activity config (the panel then
-shows "my change did nothing" or "that is the other realm's boss"), because the event and
-contributor tables carry no `state_key` column and would interleave.
+Each realm runs its own `worldserver` **and its own copy of `boss.lua`**, but they **share one
+schema** (default `ac_eluna`) and are kept apart by `state_key` — **no per-realm database needed**.
+All four tables are separated by that key:
 
-The only per-realm difference in `boss.lua` is the two constants in §2:
+| Table | How it is separated |
+|---|---|
+| `boss_activity_config` / `boss_activity_config_ext` / `boss_activity_runtime` | `state_key` is the primary key |
+| `boss_activity_events` / `boss_activity_contributors` | have a `state_key` column (added, with its index, by `boss.lua` on an old schema) |
+
+So the only per-realm difference in `boss.lua` is that **one key** in §2 (both lines must match):
 
 ```lua
-local BOSS_DB_NAME = "ac_eluna"       -- built-in default; an existing realm keeps it
-local BOSS_RUNTIME_KEY = "current"    -- "current" everywhere unless two realms share a schema
+local BOSS_DB_NAME = "ac_eluna"       -- shared schema, normally left alone
+local BOSS_RUNTIME_KEY = "current"    -- this realm's key: runtime/events/contributors
+local BOSS_CONFIG_KEY = "current"     -- this realm's key: config tables (must equal the line above)
 ```
 
-| Realm | worldserver dir | `BOSS_DB_NAME` | panel `server_overrides[<index>].custom_db_name` |
+| Realm | worldserver dir | key (both lines) | panel `server_overrides[<index>].runtime_key` |
 |---|---|---|---|
-| default / first | `D:\AzerothCore\release\<realm-a>` | `ac_eluna` (built-in default, unchanged) | same as the left column (usually no override needed) |
-| second | `D:\AzerothCore\release\<realm-b>` | `<realm-b>-eluna` | same as the left column |
-| third | … | `<realm-c>-eluna` | same as the left column |
+| main (upgraded from single-realm) | `D:\AzerothCore\release\<realm-a>` | `current` (unchanged → existing rows keep belonging to it, **zero migration**) | `current` |
+| second | `D:\AzerothCore\release\<realm-b>` | `<realm-b>` | `<realm-b>` |
+| third | … | `<realm-c>` | `<realm-c>` |
 
-Deploy with `tools/deploy-realm.ps1` (rewrites the constants, backs up the previous file, optionally
+**Two realms with the same key share one config/runtime/event set** — give every realm its own key.
+
+Deploy with `tools/deploy-realm.ps1` (rewrites the key, backs up the previous file, optionally
 syntax-checks it, prints the panel snippet):
 
 ```powershell
 # dry run first
-pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna -DryRun
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b> -DryRun
 # real deployment, including the difficulty-tier templates for that realm's world DB
-pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -DbName <realm-b>-eluna `
+pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b> `
     -LuaExe <lua.exe> -ApplyTierSql <that realm's world DB> -DbPassword <pw>
 ```
 
-On its first start in a new realm, `boss.lua` creates the schema and the four tables itself
-(`CREATE DATABASE IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS`) and seeds the defaults. To carry an
-existing realm's activity config over, export the two rows of `boss_activity_config` /
-`boss_activity_config_ext`, rename the schema in the dump and import it into the new realm.
+A new realm gets its own row seeded with defaults (`INSERT IGNORE`) on first load. To carry an
+existing realm's activity config over, export that realm's row (`WHERE state_key = '<old key>'`),
+change the key in the dump and import it.
 
-`tools/boss-lua-smoke/smoke.lua` asserts this: the constants are rewritten, the file is loaded again,
-and every DB-qualified statement must use the new schema and state_key — a hard-coded `ac_eluna`
-anywhere fails the test.
+`tools/boss-lua-smoke/smoke.lua` asserts this: the key is rewritten and the file is loaded again, and
+the event/contributor writes must carry the new key, the binding log must report it, and the shared
+schema name must stay unchanged — a hard-coded `'current'` anywhere fails the test.
 
 ## Standalone Mode (Without Web)
 

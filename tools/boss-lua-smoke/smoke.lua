@@ -497,12 +497,12 @@ assertTrue(engineCallbacks.creature["190094/1"] ~= nil,
     "受管模板 entry 由 ext 表驱动（190094 也注册了事件）")
 
 -- ------------------------------------------------- 多区绑定（本区库名 / state_key）
--- boss.lua 的「多区支持」只有一句话：部署到不同区时只改 §2 的 BOSS_DB_NAME /
--- BOSS_RUNTIME_KEY，所有 SQL 都要跟着走。这里把常量改写后**重新加载一遍**，
--- 逐条核对 SQL 真正用的库名。
--- 为什么必须动态重载而不是只看源码：真正的风险是"某处又写死了 ac_eluna"，
--- 写死的语句不会出现在源码里那两个常量上，只有跑起来才会在 SQL 里露出来。
-io.write("\n== 多区绑定（本区库名） ==\n")
+-- boss.lua 的「多区支持」只有一句话：部署到不同区时只改 §2 的 key
+-- （BOSS_RUNTIME_KEY / BOSS_CONFIG_KEY，两行必须相同），四张表都靠这个 state_key 分租。
+-- 这里把常量改写后**重新加载一遍**，既核对 SQL 用的库名，也核对写入带的是本区 key。
+-- 为什么必须动态重载而不是只看源码：真正的风险是"某处又写死了 ac_eluna / 'current'"，
+-- 写死的值不会出现在源码里那两个常量上，只有跑起来才会在 SQL 里露出来。
+io.write("\n== 多区绑定（共用库 + state_key 分租） ==\n")
 
 local function isDbQualified(sql)
     return sql:find("`boss_activity", 1, true) ~= nil
@@ -531,18 +531,25 @@ local function auditBinding(sqlList, expectDb, label)
     end
 end
 
+-- 取 INSERT 语句的第一个字符串值 —— 事件/贡献表里它就是 state_key
+local function firstInsertValue(sql)
+    return sql:match("VALUES%s*%(%s*'([^']*)'")
+end
+
 auditBinding(recorded.sql, "ac_eluna", "默认部署(ac_eluna)")
 
--- 模拟把同一份 boss.lua 部署到 70 区：只改 §2 的两行常量
+-- 模拟把同一份 boss.lua 部署到第二个区：多区共用库，所以只改 §2 的 key（库名不变）
 local sourceHandle = assert(io.open(bossPath, "r"))
 local source = sourceHandle:read("*a")
 sourceHandle:close()
 
-local targetDb, targetRuntimeKey = "<realm-b>-eluna", "realm-b"
+local targetDb, targetRuntimeKey = "ac_eluna", "realm-b"
 local rewritten, dbSubs = source:gsub('(local BOSS_DB_NAME%s*=%s*")[^"]*(")', "%1" .. targetDb .. "%2", 1)
 local rewrittenKey, keySubs = rewritten:gsub('(local BOSS_RUNTIME_KEY%s*=%s*")[^"]*(")', "%1" .. targetRuntimeKey .. "%2", 1)
+local rewrittenConfigKey, configKeySubs = rewrittenKey:gsub('(local BOSS_CONFIG_KEY%s*=%s*")[^"]*(")', "%1" .. targetRuntimeKey .. "%2", 1)
 assertTrue(dbSubs == 1, "BOSS_DB_NAME 常量可被改写（deploy-realm 脚本依赖同一处）")
 assertTrue(keySubs == 1, "BOSS_RUNTIME_KEY 常量可被改写")
+assertTrue(configKeySubs == 1, "BOSS_CONFIG_KEY 常量可被改写（面板用同一个 key 读写四张表）")
 
 local bindingLogs = {}
 local childEnv = setmetatable({
@@ -550,7 +557,7 @@ local childEnv = setmetatable({
 }, { __index = env })
 
 local boundary = #recorded.sql
-local childChunk, childErr = load(rewrittenKey, "@" .. bossPath .. ":realm-rewrite", "t", childEnv)
+local childChunk, childErr = load(rewrittenConfigKey, "@" .. bossPath .. ":realm-rewrite", "t", childEnv)
 if not childChunk then
     fail("改写后加载失败: " .. tostring(childErr))
 else
@@ -560,9 +567,35 @@ else
     end
 end
 
+-- 用子环境跑一条会写事件的命令（boss config reload → command_config_reload，无活跃 Boss 也会写），
+-- 断言事件 INSERT 带的是**本区 key** 而不是默认的 current。注意命令串按核心的约定不带前导点
+-- （AzerothCore 把 "." 去掉后才交给 handler，runConsoleCommand 传的是去掉点之后的字符串）。
+-- 贡献表的写入在离线环境里跑不到（需要真的打死 Boss），所以它的列清单用源码静态检查兜底。
+runConsoleCommand("boss config reload")
 local childSql = {}
 for i = boundary + 1, #recorded.sql do childSql[#childSql + 1] = recorded.sql[i] end
-auditBinding(childSql, targetDb, "改为 " .. targetDb .. " 的部署")
+auditBinding(childSql, targetDb, "改为 key=" .. targetRuntimeKey .. " 的部署")
+
+local eventInsertKey, eventInsertSeen = nil, false
+for _, item in ipairs(childSql) do
+    if item.sql:find("INSERT INTO", 1, true) and item.sql:find("boss_activity_events", 1, true) then
+        eventInsertSeen = true
+        eventInsertKey = firstInsertValue(item.sql)
+    end
+end
+assertTrue(eventInsertSeen, "改写 key 后仍有事件写入语句（boss config reload → command_config_reload）")
+assertTrue(eventInsertKey == targetRuntimeKey,
+    "事件写入带的是本区 key（实际 " .. tostring(eventInsertKey) .. "，期望 " .. targetRuntimeKey .. "）")
+
+assertTrue(source:find("`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `event_type`", 1, true) ~= nil,
+    "事件表 INSERT 的列清单含 state_key（结构回归）")
+assertTrue(source:find("`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `player_guid`", 1, true) ~= nil,
+    "贡献表 INSERT 的列清单含 state_key（结构回归）")
+assertTrue(source:find("EnsureBossSchemaColumn(BOSS_EVENT_TABLE, 'state_key'", 1, true) ~= nil
+    and source:find("EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'state_key'", 1, true) ~= nil,
+    "老库缺列时自动补 state_key（零迁移升级）")
+assertTrue(source:find("EnsureBossSchemaIndex(BOSS_EVENT_TABLE, 'idx_state_key_id'", 1, true) ~= nil,
+    "事件表自动补 (state_key, id) 索引")
 
 -- 启动自检日志必须报出本区绑定：运维靠它确认没串区
 local bindingLine = nil

@@ -75,27 +75,30 @@ basePrint(">>Script:BOSS SmartAI loading...OK")
 -- ========== §2 常量（不属于可调配置，改动需随版本发布） ==========
 -- 日志路径/轮转上限在 §1 里另有常量：日志先于数据库可用，不能落库。
 --
--- ★ 多区部署（多个 realm 共用一套 auth）：「本区绑定」就在下面两行。
---   一台机器上每个区各跑一份 worldserver + 一份 boss.lua，各区的配置 / 运行态 / 事件 /
---   贡献必须落在**各自的库**里，否则两个区会互相覆盖活动配置（面板上表现为"改了没生效"
---   或"看到的是别的区的 Boss"）。所以同一个 boss.lua 部署到不同区时，只改这两行：
+-- ★ 多区部署（多个 realm 共用一套 auth）：**所有区共用同一个库（默认 ac_eluna），
+--   用 state_key 分租**，不需要为每个区建库。四张表都按这个 key 区分：
+--     boss_activity_config / boss_activity_config_ext / boss_activity_runtime  → 主键就是 state_key
+--     boss_activity_events / boss_activity_contributors                        → state_key 列（BossSchema 自举/自动补列）
+--   所以同一个 boss.lua 部署到不同区时，**只改下面这一行 key**：
 --
---     默认库名（不改，等于本脚本的内置默认）  BOSS_DB_NAME = "ac_eluna"
---     第二个区                                BOSS_DB_NAME = "<realm-b>-eluna"
---     第三个区                                BOSS_DB_NAME = "<realm-c>-eluna"
+--     BOSS_RUNTIME_KEY / BOSS_CONFIG_KEY  两行必须相同（面板用同一个 key 读写全部四张表）
+--       主区（从单区升级上来的那个区）  "current"   ← 保持不动：历史行按默认值自动归到它名下，零迁移
+--       第二个区                        "<realm-b>"  例如区服索引或 RealmID
+--       第三个区                        "<realm-c>"
 --
---   BOSS_RUNTIME_KEY / BOSS_CONFIG_KEY 目前各区都用 "current"；只有当两个区**共用同一个库**
---   时才需要给其中一个区换 key（不推荐，事件/贡献表没有 state_key 列，会串在一起）。
+--   两个区用同一个 key = 两个区共用同一份配置/运行态/事件（会互相覆盖），部署时必须给每个区一个不同的 key。
+--   BOSS_DB_NAME 保持默认的 "ac_eluna" 即可（想给某个区单独一个库仍然可以，但不再是多区的前提）。
 --
---   面板侧必须与这里一致，否则面板读写的是别的区：
+--   面板侧必须与这里一致，否则面板读写的是别的区的数据：
 --     AGMP config/boss.php → server_overrides[<区服索引>].custom_db_name / .runtime_key
---   用 tools/deploy-realm.ps1 部署时会自动改写这两行并打印对应的面板配置片段。
+--   用 tools/deploy-realm.ps1 部署时会自动改写 key 并打印对应的面板配置片段。
 --
---   启动时本脚本会把生效的绑定写进本区日志（lua_scripts/lua_logs/boss.log），
---   与面板页头显示的库名对照即可确认没有串区。
-local BOSS_DB_NAME = "ac_eluna"                              -- 本区：配置与运行态所在库
-local BOSS_RUNTIME_KEY = "current"                           -- boss_activity_runtime 的 state_key
-local BOSS_CONFIG_KEY = "current"                            -- 配置表的 state_key
+--   启动时本脚本会把生效的绑定写进本区日志（lua_scripts/lua_logs/boss.log）：
+--     [BOSS] 本区绑定: db=ac_eluna configKey=<key> runtimeKey=<key>
+--   与面板页头显示的 "本区数据源: ac_eluna (state_key=<key>)" 对照即可确认没有串区。
+local BOSS_DB_NAME = "ac_eluna"                              -- 共用库（各区 state_key 不同）
+local BOSS_RUNTIME_KEY = "current"                           -- 本区 key：运行态/事件/贡献的 state_key
+local BOSS_CONFIG_KEY = "current"                            -- 本区 key：配置表的 state_key（必须与上一行相同）
 local BOSS_DECIMAL_SCALE = 100                               -- 小数落库缩放（倍率/体型 ×100 存 INT）
 local BOSS_MAIN_TABLE = "boss_activity_config"               -- 与 AGMP 面板共享的配置表
 local BOSS_EXT_TABLE = "boss_activity_config_ext"            -- 脚本私有配置表（面板用 upsert 只改提交的列，不会删行重置）
@@ -912,6 +915,39 @@ local function EnsureBossSchemaColumn(tableName, columnName, columnDefinition)
     )
 end
 
+local function BossSchemaIndexExists(tableName, indexName)
+    local query = CharDBQuery(
+        "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = '"
+            .. BOSS_DB_NAME
+            .. "' AND TABLE_NAME = '"
+            .. tableName
+            .. "' AND INDEX_NAME = '"
+            .. indexName
+            .. "';"
+    )
+
+    return query ~= nil and query:GetUInt32(0) > 0
+end
+
+-- 补索引：多区共用同一个库时，事件/贡献表靠 state_key 过滤 + 排序读，没索引会退化成全表扫描。
+local function EnsureBossSchemaIndex(tableName, indexName, columnList)
+    if BossSchemaIndexExists(tableName, indexName) then
+        return
+    end
+
+    CharDBExecute(
+        'ALTER TABLE `'
+            .. BOSS_DB_NAME
+            .. '`.`'
+            .. tableName
+            .. '` ADD INDEX `'
+            .. indexName
+            .. '` ('
+            .. columnList
+            .. ');'
+    )
+end
+
 -- ============================================================================
 --  §4 数据库表结构自举（ac_eluna）
 -- ----------------------------------------------------------------------------
@@ -999,6 +1035,7 @@ local function EnsureBossSchema(force)
         .. 'PRIMARY KEY (`state_key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
     CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_EVENT_TABLE .. '` ('
         .. '`id` INT NOT NULL AUTO_INCREMENT,'
+        .. '`state_key` VARCHAR(32) NOT NULL DEFAULT "current",'
         .. '`boss_guid` INT NOT NULL DEFAULT 0,'
         .. '`boss_entry` INT NOT NULL DEFAULT 0,'
         .. '`boss_name` VARCHAR(120) NOT NULL DEFAULT "",'
@@ -1009,10 +1046,13 @@ local function EnsureBossSchema(force)
         .. '`payload_json` TEXT NULL,'
         .. '`created_at` INT NOT NULL DEFAULT 0,'
         .. 'PRIMARY KEY (`id`),'
+        .. 'KEY `idx_state_key_id` (`state_key`, `id`),'
+        .. 'KEY `idx_state_key_created` (`state_key`, `created_at`),'
         .. 'KEY `idx_created_at` (`created_at`),'
         .. 'KEY `idx_event_type` (`event_type`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
     CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_CONTRIBUTOR_TABLE .. '` ('
         .. '`id` INT NOT NULL AUTO_INCREMENT,'
+        .. '`state_key` VARCHAR(32) NOT NULL DEFAULT "current",'
         .. '`boss_guid` INT NOT NULL DEFAULT 0,'
         .. '`boss_entry` INT NOT NULL DEFAULT 0,'
         .. '`boss_name` VARCHAR(120) NOT NULL DEFAULT "",'
@@ -1029,6 +1069,9 @@ local function EnsureBossSchema(force)
         .. '`guaranteed_reward` TINYINT NOT NULL DEFAULT 0,'
         .. '`created_at` INT NOT NULL DEFAULT 0,'
         .. 'PRIMARY KEY (`id`),'
+        .. 'KEY `idx_state_key_id` (`state_key`, `id`),'
+        .. 'KEY `idx_state_key_created` (`state_key`, `created_at`),'
+        .. 'KEY `idx_state_key_player` (`state_key`, `player_guid`),'
         .. 'KEY `idx_created_at` (`created_at`),'
         .. 'KEY `idx_player_guid` (`player_guid`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
     CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_MAIN_TABLE .. '` ('
@@ -1089,6 +1132,16 @@ local function EnsureBossSchema(force)
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'was_killer', 'TINYINT NOT NULL DEFAULT 0')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'rewarded_random', 'TINYINT NOT NULL DEFAULT 0')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'guaranteed_reward', 'TINYINT NOT NULL DEFAULT 0')
+
+    -- 多区共用同一个库时，事件/贡献表靠 state_key 分租；老库缺这一列时自动补上。
+    -- 默认值 'current' 让历史行自动归属「主区」，所以从单区升级上来不需要任何数据迁移。
+    EnsureBossSchemaColumn(BOSS_EVENT_TABLE, 'state_key', 'VARCHAR(32) NOT NULL DEFAULT "current"')
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'state_key', 'VARCHAR(32) NOT NULL DEFAULT "current"')
+    EnsureBossSchemaIndex(BOSS_EVENT_TABLE, 'idx_state_key_id', '`state_key`, `id`')
+    EnsureBossSchemaIndex(BOSS_EVENT_TABLE, 'idx_state_key_created', '`state_key`, `created_at`')
+    EnsureBossSchemaIndex(BOSS_CONTRIBUTOR_TABLE, 'idx_state_key_id', '`state_key`, `id`')
+    EnsureBossSchemaIndex(BOSS_CONTRIBUTOR_TABLE, 'idx_state_key_created', '`state_key`, `created_at`')
+    EnsureBossSchemaIndex(BOSS_CONTRIBUTOR_TABLE, 'idx_state_key_player', '`state_key`, `player_guid`')
 
     BOSS_SCHEMA_READY = true
     return true
@@ -2628,9 +2681,10 @@ end
     local context = ResolveBossContext(source)
     local sql = string.format(
         "INSERT INTO `%s`.`boss_activity_events` ("
-            .. "`boss_guid`, `boss_entry`, `boss_name`, `event_type`, `event_note`, `actor_name`, `actor_guid`, `payload_json`, `created_at`) "
-            .. "VALUES (%d, %d, '%s', '%s', '%s', '%s', %d, '%s', %d);",
+            .. "`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `event_type`, `event_note`, `actor_name`, `actor_guid`, `payload_json`, `created_at`) "
+            .. "VALUES ('%s', %d, %d, '%s', '%s', '%s', '%s', %d, '%s', %d);",
         BOSS_DB_NAME,
+        BossSqlEscape(BOSS_RUNTIME_KEY, 32),
         tonumber(context.bossGuid or 0) or 0,
         tonumber(context.bossEntry or 0) or 0,
         BossSqlEscape(context.bossName or "", 120),
@@ -2914,10 +2968,11 @@ local function InsertBossContributorSnapshot(source, record, score, rewardedRand
     local context = ResolveBossContext(source)
     local sql = string.format(
         "INSERT INTO `%s`.`boss_activity_contributors` ("
-            .. "`boss_guid`, `boss_entry`, `boss_name`, `player_guid`, `player_name`, `account_id`, `damage_done`, `healing_done`, "
+            .. "`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `player_guid`, `player_name`, `account_id`, `damage_done`, `healing_done`, "
             .. "`threat_samples`, `presence_samples`, `contribution_score`, `was_killer`, `rewarded_random`, `guaranteed_reward`, `created_at`) "
-            .. "VALUES (%d, %d, '%s', %d, '%s', %d, %d, %d, %d, %d, %.6f, %d, %d, %d, %d);",
+            .. "VALUES ('%s', %d, %d, '%s', %d, '%s', %d, %d, %d, %d, %d, %.6f, %d, %d, %d, %d);",
         BOSS_DB_NAME,
+        BossSqlEscape(BOSS_RUNTIME_KEY, 32),
         tonumber(context.bossGuid or 0) or 0,
         tonumber(context.bossEntry or 0) or 0,
         BossSqlEscape(context.bossName or "", 120),

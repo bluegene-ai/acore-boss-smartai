@@ -42,7 +42,7 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 | 放行 | 非 boss 命令返回 `true`、不产生 boss 回复（不拦截其他 GM 指令） |
 | 副作用 | `.boss clear` 写 `command_clear` 事件并把 runtime 复位为 `idle` |
 | 事件 | `PLAYER_EVENT_ON_HEAL(42/65)` 与受管 entry（含 ext 表额外指定的档位 entry）的 6 个 creature 事件全部注册 |
-| 多区绑定 | 把 `BOSS_DB_NAME` / `BOSS_RUNTIME_KEY` 改写后重新加载，**每条引用库名的 SQL 都必须换成新库名**、runtime 语句必须用新 state_key，启动日志必须报出本区绑定；任何一处写死的 `ac_eluna` 都会失败 |
+| 多区绑定 | 把 §2 的 key（`BOSS_RUNTIME_KEY` / `BOSS_CONFIG_KEY`）改写后重新加载：事件写入必须带新的 key、启动日志必须报出新 key、runtime 语句必须用新 key，共用库名不变，老库自动补 `state_key` 列与索引；任何一处写死的 `'current'` 都会失败 |
 
 ## 配置一致性（重构时用的一次性工具，不在本目录）
 
