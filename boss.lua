@@ -433,6 +433,12 @@ local HELPER_ENTRIES = {16244, 15976, 16018, 16165}
 local ALLY_HELPER_ENTRY = 20977
 
 -- ---- [reward] 奖励 ----
+-- 6 个奖池彼此独立：每池各自掷一次 chance，各自抽一次获奖名单，互斥不作（一个人可以同时中多个池）。
+-- 选人规则（winnerMode）：
+--   all   = 全部有效参战者，此时 winnerCount 列不生效（面板/日志一律显示"全部有效参战"）
+--   count = 从有效参战者里抽 winnerCount 人
+-- ★ 抽签名额上限 = 有效参战人数：winnerCount ≥ 参战人数时该池退化成"全员发放"（等价于 all），
+--   日志会打 ⚠ 告警（见 §10 结算流程）。参战人数波动大时请把名额配得明显小于常见人数。
 local REWARD_POOL_COUNT = 6
 local REWARD_POOLS = {
     -- 池 1：原「保底」——人人有份
@@ -5325,15 +5331,24 @@ local function OnBossDied(event, creature, killer)
     end
 
     print(" [奖励发放]符合条件的玩家总数: " .. #playersList)
+    local eligiblePlayerCount = #playersList
     for index = 1, REWARD_POOL_COUNT do
         local pool = REWARD_POOLS[index]
         if pool and pool.enabled then
-            print(string.format(" [奖励发放]奖池%d: 概率=%d%% 获奖人数=%s 职业过滤=%s 奖品=%d件",
+            -- 配置体检：count 模式下名额 ≥ 参战人数时，该池本次必然发成"全体"（与 all 模式等价）。
+            -- 这里显式标警，避免配置写错（例如参战 6 人却填了 9 人）却毫无提示。
+            local winnerCountConfig = tonumber(pool.winnerCount) or 0
+            local degenerateAll = pool.winnerMode ~= "all"
+                and eligiblePlayerCount > 0
+                and winnerCountConfig >= eligiblePlayerCount
+            print(string.format(" [奖励发放]奖池%d: 概率=%d%% 获奖人数=%s 职业过滤=%s 奖品=%d件%s",
                 index,
                 pool.chance,
                 pool.winnerMode == "all" and "全部有效参战" or (tostring(pool.winnerCount) .. "人"),
                 pool.classFilter and "开" or "关",
-                #(pool.items or {})))
+                #(pool.items or {}),
+                degenerateAll and string.format(" ⚠名额%d≥有效参战%d人，将按全体发放",
+                    winnerCountConfig, eligiblePlayerCount) or ""))
         end
     end
 
@@ -5377,7 +5392,6 @@ local function OnBossDied(event, creature, killer)
                         if pool.winnerMode == "all" then
                             recipients = playersList
                         else
-                            local limit = math.min(pool.winnerCount, #playersList)
                             local selectionPool = contributorPool
                             if #selectionPool == 0 then
                                 selectionPool = {}
@@ -5388,6 +5402,18 @@ local function OnBossDied(event, creature, killer)
                                         record = {name = SafeGetUnitName(player)},
                                     })
                                 end
+                            end
+
+                            -- 保护：抽签名额上限 = 实际候选人数（正常等于有效参战人数）。
+                            -- winnerCount 配大了不会报错，只会静默发成"全体"，所以这里显式截断并告警，
+                            -- 让 boss.log 能看出是配置问题而不是抽签运气。
+                            result.requested_winners = pool.winnerCount
+                            local limit = math.min(pool.winnerCount, #selectionPool)
+                            if pool.winnerCount >= #selectionPool then
+                                result.degenerate_all = true
+                                print(string.format(
+                                    " [奖励发放]奖池%d: 名额配置=%d ≥ 候选人数=%d，本次按全体发放（建议把该池获奖人数改小）",
+                                    index, pool.winnerCount, #selectionPool))
                             end
 
                             for _, entry in ipairs(SelectWeightedRewardWinners(selectionPool, limit)) do
