@@ -76,11 +76,16 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 - 技能池预设 / 强度档位系数 / 打断法术池（§5 内容库）：属于「技能内容」（法术 ID、冷却、触发条件），随版本发布；
   可调的部分（选哪套预设、哪个档位、随机池里放哪些预设）已经落库。
-- 每个预设 = 3 个阶段的技能池 + **6 条连招链**（`comboChains`，2026-09 由每套 3 条扩到 6 条，共 36 条）+ 3 个开场技能。
+- **10 套技能预设**（2026-09 由 6 套扩到 10 套）：原有 `storm_siege` 风暴攻城 / `ember_storm` 余烬风暴 /
+  `frost_whiteout` 冰封压境 / `venom_pursuit` 毒猎追击 / `grave_bombard` 墓火轰炸 / `spellbreak_bulwark` 破法壁垒，
+  新增 `arcane_cataclysm` 奥术崩解 / `plague_swarm` 瘟疫蜂群 / `iron_vanguard` 钢铁先锋 / `blood_covenant` 鲜血誓约。
+  每个预设 = 3 个阶段的技能池 + **6 条连招链**（`comboChains`，2026-09 由每套 3 条扩到 6 条，共 **60 条**）+ 3 个开场技能。
   连招是「每条 3 个法术、按序施放、不再做目标条件判定」的固定小连击（`SkillAI:TryComboChain` + 施放循环），
   硬性不变量：**连招里用到的法术必须出现在该预设自己的技能池里**（冒烟测试强制），连招名全局唯一。
-- 法术来源与校验：全部取自 WLK 团队副本。本轮扩充给 6 个预设补进 **29 条新法术**（法术 ID 37 → 66，
-  技能池条目 72 → 101），每条的 `name` 都逐字取自客户端 `Spell.dbc` 的 enCN 名称槽位。
+  新增 4 套预设后，面板「技能池随机」的勾选框会从 6 个变成 10 个（面板侧要同步 `config/boss.php` 的
+  `preset_values` 与 `resources/lang/{zh_CN,en}/boss.php` 的 labels/summary，否则面板不认这几个 key）。
+- 法术来源与校验：全部取自 WLK 团队副本。两轮扩充共补进 **53 条新法术**（法术 ID 37 → 66 → **99**，
+  技能池条目 72 → 101 → **144**），每条的 `name` 都逐字取自客户端 `Spell.dbc` 的 enCN 名称槽位。
   校验工具：`tools/spell-check/spell-check.lua`（存在性 + 名称逐字比对）；团本来源证据取自
   AzerothCore 源码里各副本 Boss 脚本的 `SPELL_* = <id>` 枚举与真实 `CastSpell/DoCast` 调用点（最强证据），
   辅以 `spell_script_names`（有脚本者标"需注意"）。
@@ -95,7 +100,8 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
   该脚本按**行首**锚定键名（避免 `烈焰余烬=` 被 `余烬=` 子串误判），可重复执行。
   另：池子里有 3 条法术来自 **5 人本**（King Dred / 达克萨隆要塞、Slad'ran / 古达克、Krick&Ick / 萨隆矿坑），
   已在注释里如实标注；若要严格"只用团本技能"，需要替换成团本等价法术（属内容决策，非缺陷）。
-  新增连招的喊话落库脚本：`sql/2026_09_26_combo_yells_expansion.sql`——喊话存在扩展表 `taunt_combo_yells_text`，
+  新增连招的喊话落库脚本：`sql/2026_09_26_combo_yells_expansion.sql`（第一批 18 条）与
+  `sql/2026_09_26_combo_yells_new_presets.sql`（4 套新预设的 24 条）——喊话存在扩展表 `taunt_combo_yells_text`，
   **库里的值会整体覆盖脚本默认值**，所以只改脚本默认文案线上不会生效。
 - 显示用文本（职业中文名等）、小怪召唤的散布半径、技能条件里的个别常量：属于逻辑常量，不是调参项。
 

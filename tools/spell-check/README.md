@@ -59,7 +59,7 @@ lua52_interpreter.exe spell-check.lua [选项] [脚本路径]
 1. 逐字符扫描，跳过字符串与注释（`--` 行注释、`--[[ ]]` 块注释、单双引号字符串含转义），
    对 `{`/`}` 做配平，定位 `local SKILL_PRESET_LIBRARY = { ... }` 与
    `local INTERRUPT_SPELL_LIBRARY = { ... }` 的完整字节区间。
-2. 在 `SKILL_PRESET_LIBRARY` 区间内枚举**顶层** `key = { ... }`，得到 6 个预设；
+2. 在 `SKILL_PRESET_LIBRARY` 区间内枚举**顶层** `key = { ... }`（当前 10 个预设，数量不写死）；
    每个预设块内再定位 `skillPools` / `comboChains` / `openingSkills` 三个子表。
 3. 分类提取：
    - `skillPools[N]`：区间内每条 `spellId = <数字>`，并向后取同一花括号内最近的 `name = "<x>"`

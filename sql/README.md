@@ -63,3 +63,17 @@
    **已在场的 Boss 会继续用旧模板**：重生或手动 `.boss clear` + `.boss spawn` 后生效。
 
 GM 命令见项目根目录 `README.md` 的「命令」表。
+
+## 技能内容扩充的配套喊话（2026_09_26）
+
+技能池 / 连招链的**内容**在 `boss.lua`（随版本发布），但**喊话存在扩展表**，两者要配套上线：
+
+| 脚本 | 用途 | 与什么配套 |
+|---|---|---|
+| `2026_09_26_skill_yells_rename.sql` | 把 22 个技能施放喊话的键名改成 Spell.dbc 官方名 | **必须**跟同名版本的 `boss.lua` 一起执行：`skillCastYells` 以技能名为键，只改脚本会让这 22 个技能静默不喊话（然后 `.reload ale`） |
+| `2026_09_26_combo_yells_expansion.sql` | 给第一批扩充的 18 条连招补喊话 | 6 套预设的 `boss.lua` 版本；`.boss config reload` 即可 |
+| `2026_09_26_combo_yells_new_presets.sql` | 给新增 4 套预设（奥术崩解/瘟疫蜂群/钢铁先锋/鲜血誓约）的 24 条连招补喊话 | 10 套预设的 `boss.lua` 版本；`.boss config reload` 即可 |
+
+三个脚本都是**逐键幂等**（已存在就跳过，只追加缺失键，不动 GM 改过的文案），键名按**行首**锚定
+（避免 `烈焰余烬=` 被 `余烬=` 子串误判）。多区部署时把脚本里的库名与 `state_key` 换成该区的
+（`tools/deploy-realm.ps1` 只改写它自带的 tier SQL，不会自动改写这三个）。
