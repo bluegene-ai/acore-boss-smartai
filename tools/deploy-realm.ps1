@@ -1,30 +1,27 @@
 # ============================================================================
 #  deploy-realm.ps1 — 把 boss.lua 部署到某个区（多区部署标准步骤）
 # ----------------------------------------------------------------------------
-#  多区（多个 realm 共用一套 auth）时，每个区各跑一份 worldserver + 一份 boss.lua，
-#  但**共用同一个数据库**（默认 ac_eluna），靠 state_key 把各区数据分租。
-#  所以各区之间唯一的差别就是 boss.lua §2 里的那一个 key（BOSS_RUNTIME_KEY +
-#  BOSS_CONFIG_KEY，两行必须相同）。本脚本负责：
+#  多区（多个 realm 共用一套 auth）各区共用同一个库（默认 ac_eluna），靠 state_key 分租；
+#  各区之间唯一的差别就是 boss.lua §2 的那一个 key（BOSS_RUNTIME_KEY + BOSS_CONFIG_KEY，两行必须相同）。
 #
 #    1. 从仓库取 boss.lua，改写 §2 的本区 key → 写入 <RealmRoot>\lua_scripts\boss.lua
-#       （-DbName 只在你要给某个区单独一个库时才需要给；默认 ac_eluna，不改库名）
-#    2. 写入前自动备份原文件（boss.lua.<时间戳>.bak）
+#       （-DbName 只在给某个区单独一个库时才需要；默认 ac_eluna）
+#    2. 写入前自动备份（boss.lua.<时间戳>.bak）
 #    3. 可选：语法检查（-LuaExe）与导入难度档位 SQL（-ApplyTierSql <world 库>）；
-#       导入前会把 SQL 里写死的库名**与本区 key** 一起改写，避免动到别的区的配置
+#       导入前会把 SQL 里写死的库名**与本区 key** 一起改写，避免动到别的区
 #    4. 打印 AGMP 面板 config/boss.php 需要同步的 server_overrides 片段
 #
 #  用法：
 #    # 主区（从单区升级上来）：key 保持 current，不改库名
 #    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-a>
-#    # 第二个区：必须给它一个自己的 key（不能是 current，否则和主区共用一份数据）
+#    # 第二个区：必须给它自己的 key（不能是 current，否则与主区共用一份数据）
 #    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b>
 #    # 连难度档位模板一起导进该区的 world 库
 #    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b> `
 #        -ApplyTierSql <该区 world 库>
 #
-#  部署完记得：
-#    · 让该区 worldserver 重新加载 Eluna 脚本（游戏内 .reload ale，或重启该区）
-#    · 面板 config/generated/boss.php 的 server_overrides 加上该区（脚本会打印片段）
+#  部署完：让该区 worldserver 重新加载 Eluna（.reload ale 或重启），并把面板
+#          config/generated/boss.php 的 server_overrides 加上该区（脚本会打印片段）。
 # ============================================================================
 
 [CmdletBinding()]
@@ -35,8 +32,6 @@ param(
     # 数据库名；多区共用库时保持默认 ac_eluna 即可（只有想给该区单独一个库时才改）
     [string]$DbName = 'ac_eluna',
 
-    # ★ 本区的 state_key：主区用 current（历史数据默认值），其它区各给一个不同的值
-    #   （建议用面板区服索引或 RealmID，如 "1"/"2"）。两个区用同一个 key = 共用一份数据。
     [string]$RuntimeKey = 'current',
 
     # 源文件；默认取本仓库根目录的 boss.lua

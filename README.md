@@ -5,17 +5,17 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 ## Features
 
 - Smart combat AI with multiple skill presets and difficulty modes.
+- **Random skill preset**: when enabled, every spawn/respawn draws one preset from the pool ticked in the panel (AGMP → Extended config → Random skill preset); see [Random skill preset](#random-skill-preset).
+- **Six independent reward pools**: enable switch / chance / winner count (every eligible player or a fixed number) / prize item list,
+  each configured on its own; the panel takes item IDs and shows the resolved item names, and prizes are
+  filtered per class so nobody is handed gear they cannot use (see [Rewards: six independent pools](#rewards-six-independent-pools)).
 - **Selectable power tiers** backed by dedicated `creature_template` entries (see [Difficulty tiers](#difficulty-tiers)).
 - **Daily schedule**: start and stop the activity automatically by time windows (AGMP → Extended config → Schedule); see [Daily schedule](#daily-schedule).
 - **All settings live in the database**: the script only ships defaults, the running config comes from `ac_eluna` (see [Where to change config](#where-to-change-config)).
-- Runtime persistence in `ac_eluna`:
-  - `boss_activity_runtime`
-  - `boss_activity_config` (shared with the AGMP panel)
-  - `boss_activity_config_ext` (script-private settings)
-  - `boss_activity_events`
-  - `boss_activity_contributors`
+- Runtime persistence in `ac_eluna`: `boss_activity_runtime`, `boss_activity_config` (shared with the AGMP panel),
+  `boss_activity_config_ext` (script-private settings), `boss_activity_events`, `boss_activity_contributors`.
 - Automatic schema bootstrap and migration in Lua (no Web-side table creation required).
-- Dedicated boss templates: the activity boss no longer borrows a dungeon boss, so no core `SmartAI` scripts run on top of Eluna.
+- Dedicated boss templates: no core `SmartAI` scripts run on top of Eluna.
 - In-game / console commands:
 
 | Command | Effect |
@@ -27,18 +27,19 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 | `.boss clear` (alias `.boss despawn`) | Remove the active boss without rewards and reset the runtime row |
 | `.boss rebase` | Recompute base health from the template and re-apply the multiplier (**out of combat only**) |
 | `.boss config reload` | Hot reload config from `ac_eluna` (used by AGMP after saving) |
-| `.boss config show [group]` | Print the effective config (no group = list the 17 groups) |
+| `.boss config show [group]` | Print the effective config (no group = list the 24 groups) |
 | `.boss preset list` / `.boss preset <key>` | List / switch the skill preset |
+| `.boss preset random on\|off` | Toggle "draw a random skill preset on every spawn" (same ext config as the panel) |
+| `.boss preset pool <key,key>` / `pool all` | Set the random pool / clear it (empty = every preset) |
 | `.boss difficulty list` / `.boss difficulty <key>` | List / switch the skill cadence tier |
 | `.boss help` | Help |
 
 ## Where to change config
 
-`boss.lua` keeps **shipped defaults** in one place (§3 "配置区" at the top of the file).
-Once a row exists in the database those defaults are no longer used — bootstrap writes
-happen with `INSERT IGNORE`. Precedence:
+`boss.lua` keeps **shipped defaults** in one place (§3 "配置区" at the top of the file). Once a row
+exists in the database those defaults are no longer used — bootstrap writes happen with `INSERT IGNORE`. Precedence:
 
-1. **AGMP panel** — the *Basic config* tab edits `boss_activity_config` (boss identity, stats, spawn points, skill preset, rewards); the *Extended config* tab edits `boss_activity_config_ext` (yells, taunts, AI cadence, phase thresholds, patrol, minions, helpers, classes, managed tiers), grouped into second-level tabs.
+1. **AGMP panel** — the *Basic config* tab edits `boss_activity_config` (boss identity, stats, spawn points, skill preset, participation weights); the *Extended config* tab edits `boss_activity_config_ext` (yells, taunts, AI cadence, phase thresholds, patrol, minions, helpers, classes, managed tiers, random skill preset, **the six reward pools**, schedule), grouped into second-level tabs.
 2. **Database** — `boss_activity_config` (panel-shared columns) and `boss_activity_config_ext` (script-private columns).
 3. **Script §3 defaults** — only for a brand-new deployment without a config row.
 
@@ -48,12 +49,14 @@ After editing, run `.boss config reload` (the panel does this automatically) or 
 
 | Table | Contents | Written by |
 |---|---|---|
-| `boss_activity_config` | Boss identity, level/scale/health multiplier, auras, ally helper, spawn points, skill preset, rewards | AGMP panel (`REPLACE INTO`, whole row) + Lua |
-| `boss_activity_config_ext` | Yells, combat taunts (12 text lists), AI cadence, phase thresholds, patrol, minion AI, helper entries, class types + class reward pools, managed tier entries, **daily schedule** | Lua (create/seed) + AGMP panel (`INSERT ... ON DUPLICATE KEY UPDATE`, submitted columns only) |
+| `boss_activity_config` | Boss identity, level/scale/health multiplier, auras, ally helper, spawn points, skill preset, **participation weights / eligible range** (reward items live in the six pools of the ext table) | AGMP panel (`REPLACE INTO`, whole row) + Lua |
+| `boss_activity_config_ext` | Yells, combat taunts (12 text lists), AI cadence, phase thresholds, patrol, minion AI, helper entries, class types + class reward pools, managed tier entries, **random skill preset**, **six independent reward pools**, **daily schedule** | Lua (create/seed) + AGMP panel (`INSERT ... ON DUPLICATE KEY UPDATE`, submitted columns only) |
 
-Why two tables: AGMP saves the main table with `REPLACE INTO`, which resets every column it
-does not know about to the table default; script-private settings there would be wiped on each
-panel save. The panel only upserts the ext table, so columns the script adds later survive.
+The split is required: AGMP saves the main table with `REPLACE INTO`, which resets every column it
+does not know about to the table default; the panel only upserts the ext table, so script-private
+columns survive a panel save. **Ext-table columns must stay in the order the panel mirrors** —
+append new columns at the end, because `tools/verify_boss_ext_page.php` compares panel schema and
+Lua descriptor table column by column.
 
 ### Adding a config item
 
@@ -62,21 +65,89 @@ panel save. The panel only upserts the ext table, so columns the script adds lat
    `CREATE TABLE`) or `BOSS_CONFIG_SCHEMA_EXT` (script-private) with
    `group / column / kind / target / key` (ext rows also need `ddl`).
 3. The ext table DDL, the read path, the write path and `.boss config show` all follow
-   automatically. To make it editable in the panel, add the column to AGMP's
+   automatically. To make it editable in the panel, add the column at the end of AGMP's
    `config/boss.php` (`ext_fields`, with type/bounds) plus its zh_CN/en label —
    `php tools/verify_boss_ext_page.php` cross-checks the panel schema against this
    descriptor table column by column.
 
 Value kinds (`kind`): `int`, `bool`, `scaled` (decimal ×100 stored as INT), `text`,
 `text_keep`, `intlist`, `lines`, `keyedlines`, `keyedword`, `keyedintlist`, `spawnpoints`.
+The panel adds two of its own: `schedule_windows` (daily windows, validated and normalised by
+`Domain\Support\ScheduleWindows` before saving) and `preset_multi` (preset checkboxes, still stored
+as a comma-separated key list).
 
 ### What intentionally stays in the script
 
-- Skill presets / difficulty coefficients / interrupt spell pool (§5 content library): these
-  are combat *content* (spell ids, cooldowns, trigger conditions), released with the version;
-  the selectable parts (which preset, which tier) are in the database.
+- Skill presets / difficulty coefficients / interrupt spell pool (§5 content library): combat
+  *content* (spell ids, cooldowns, trigger conditions), released with the version; the selectable
+  parts (which preset, which tier, which presets are in the random pool) are in the database.
 - Display strings (class names), minion scatter distances and a few condition constants:
   logic constants rather than tunables.
+
+## Rewards: six independent pools
+
+Six identically shaped, fully independent reward pools live in `boss_activity_config_ext`
+(AGMP → Extended config → Reward pools); each pool has six fields:
+
+| Field | Meaning |
+|---|---|
+| `reward_pool_N_enabled` | Whether the pool takes part in the payout at all |
+| `reward_pool_N_chance` | Trigger chance (%), rolled once per kill for every enabled pool |
+| `reward_pool_N_winner_mode` | `all` = every eligible player wins; `count` = draw a fixed number of winners (weighted by contribution or pure random, see `random_reward_mode`) |
+| `reward_pool_N_winner_count` | Winner count for `count` mode (never more than the number of eligible players) |
+| `reward_pool_N_class_filter` | "Only prizes the winner can actually use" (on by default) |
+| `reward_pool_N_items_text` | Prize item IDs; each winner draws **one** item from the pool |
+
+Settlement on boss death: build the eligible-participant list → roll each enabled pool once → turn the winner mode into a winner
+list → every winner draws one item **they can use** from that pool. Pools never affect each other, the per-pool win bitmap is stored
+in `boss_activity_contributors.reward_pools_mask` (bit N = pool N won) and the `reward_granted` event carries the full breakdown.
+
+**Class filtering (never hand out unusable gear)** — with `class_filter=1`, usability of each prize is decided like this:
+
+1. the item appears in *Class config → class reward pools* (`class_reward_items_text`, key = class ID) → **that map is authoritative**:
+   only a class whose list contains the item may receive it;
+2. the item is absent from the map (mounts / formulas / generic items) → ask the core `Player:CanUseItem`
+   (class/race/level restrictions);
+3. the core gives no verdict (old build / exception) → treat the item as unrestricted so a pool never silently dries up.
+
+Pools may therefore mix all classes' gear: warriors only receive warrior-list items, mages only
+mage-list items, and a winner with nothing usable in that pool skips it (the log says why).
+
+Factory defaults: pool 1 "guaranteed" everyone 100% (`40753`), pool 2 "base" 3 winners 100%,
+pool 3 "formula" 3 winners 10%, pool 4 "mount" 1 winner 15%, pool 5 "class" 3 winners 60% (union of
+the 27 class items + class filter), pool 6 off as a spare.
+
+**Upgrading an existing deployment**: run `sql/2026_09_26_reward_pools.sql` once (idempotent: adds the six pools' columns → seeds the
+default prize lists on existing rows → drops the 13 legacy reward columns), then `.reload ale` or restart the worldserver; `boss.lua`
+performs the same add/drop migration at load time.
+
+## Random skill preset
+
+When enabled, **every spawn/respawn draws one skill preset at random** from the pool (that boss
+keeps the drawn preset until it dies) instead of the fixed `skill_preset`.
+
+Settings live in `boss_activity_config_ext` (AGMP → Extended config → Random skill preset):
+
+| Column | Default | Meaning |
+|---|---|---|
+| `skill_preset_random_enabled` | `0` | Draw one preset per spawn |
+| `skill_preset_pool_text` | `''` | Pool: comma-separated preset keys (checkboxes in the panel); **empty = every preset** |
+
+Behaviour:
+
+- The draw happens **before spawning** — `.boss spawn`, the schedule tick, a GM spawning at their own position
+  and the respawn timer all count as one spawn. A refused spawn neither consumes a draw nor changes the current preset.
+- Unknown keys in the pool are logged and skipped; an empty pool (or one with no valid key) falls back to every preset
+  in `SKILL_PRESET_ORDER`, so a mistyped pool never turns into a boss that casts nothing.
+- With random off the fixed `boss_activity_config.skill_preset` is used; with random on that value is only a fallback.
+- **Saving in the panel never re-rolls a live boss**: the draw only changes on the next spawn/respawn
+  (a manual `.boss preset <key>` is remembered the same way).
+- Use `.boss preset list` (or the panel runtime card) to see which preset is actually active;
+  `boss_activity_runtime.skill_preset` stores the preset the live boss is using.
+
+> **Upgrade order**: these two columns are created/migrated by `boss.lua`. Update `boss.lua` and let worldserver load it
+> once (`EnsureBossExtTableColumns` adds the columns), then update the AGMP panel. The other way round (panel first) the
+> extended config page keeps reporting a read/save failure until Lua has added the columns.
 
 ## Daily schedule
 
@@ -121,7 +192,7 @@ and normalises on save, and all switching happens in the Lua tick.
 
 ## Difficulty tiers
 
-Instead of reusing `entry 647` (Captain Greenskin from the Deadmines, whose template carries `AIName=SmartAI` plus two `smart_scripts` rows), the activity boss uses dedicated level-83 templates with no `AIName`, no `smart_scripts` and no loot:
+The activity boss uses dedicated level-83 templates with no `AIName`, no `smart_scripts` and no loot:
 
 | entry | tier | HealthModifier | DamageModifier | rank | health @ multiplier 1500 |
 |---|---|---|---|---|---|
@@ -135,26 +206,22 @@ Instead of reusing `entry 647` (Captain Greenskin from the Deadmines, whose temp
 - The panel's health multiplier is a global knob: changing it scales all tiers proportionally.
 - SQL for the templates: `sql/2026_09_23_activity_boss_tiers_190090_190093.sql` (see `sql/README.md` for the deploy runbook).
 
-## Defects fixed in the 2026-09 review
+## Regression constraints (guarded by the smoke test)
 
-| Severity | Issue | Fix |
-|---|---|---|
-| P1 | `GetCreatureByGUID()` does not exist in mod-ale/Eluna, so the "recover the live boss from the DB" branch was dead code → after a Lua reload the DB row was wiped as stale while the boss was still alive, and the next `.boss spawn` created a **second** boss | Look the creature up with `GetMapById()` + `GetUnitGUID(low, entry)` + `Map:GetWorldObject()` |
-| P1 | `IsManagedBossEntry`, `DEFAULT_SPAWN_POINTS` and `activeBossInfo` were referenced **before** their `local` declarations, so those references resolved to globals (`nil`) — `activeBossInfo` silently disabled renaming the live boss on config reload | Forward declare them at the top of the file (and register all tier entries, not just the configured one) |
-| P1 | `rebase`/`config reload` used the **current** max health as the base → every reload multiplied health again (with multiplier 1500: 4.4M → 6.6B, overflowing `uint32`), and unconditionally healed the boss to full | Recompute the base from the template via `Creature:UpdateEntry()` while **out of combat** (it resets the threat table); in combat fall back to `current / multiplier` so it never compounds; heal only on first spawn or when explicitly requested |
-| P1 | `Unit:SetLevel()` only writes `UNIT_FIELD_LEVEL` and does not recompute creature stats, so `bossLevel = 83` was cosmetic (stats came from the level-20 template) | Level-83 templates with real WotLK stat rows (`exp=2`) |
-| P1 | Contribution stats were reset on every enter-combat and discarded on leave-combat, so damage dealt before a reset never reached the snapshot or the reward roll | Accumulate per boss guid; release only on death settlement or `.boss clear` |
-| P2 | Config auras were only ever `AddAura`-ed — auras removed from the config were never removed from the boss | Track applied auras per guid and `RemoveAura` the difference |
-| P2 | The script overwrote the **global** `print`, so every Eluna script loaded after it logged into `boss.log` instead of the console | Shadow `print` file-locally (`local print = BossLog`); the "loading OK" banner still goes to the console |
-| P2 | No log rotation; unbounded log growth | 5 MB rotation to `boss.log.<timestamp>.bak` |
-| P2 | Event/contributor text could exceed its column width (strict mode would silently drop the whole insert) | UTF-8-safe truncation at the column width |
-| P2 | Empty `SPAWN_POINTS` would raise `math.random(0)` ("interval is empty") | Explicit guard with a log line |
-| P2 | Info-only subcommands (`.boss help`, `preset list`, `difficulty list`) returned **no** `[AGMP_OK]`/`[AGMP_ERROR]` marker, so strict callers judged them as failures | First line of those replies goes through `BossReply` |
-| P3 | `bossRewardedGUIDs` grew forever | Cleared on death |
+- `GetCreatureByGUID()` does not exist in mod-ale/Eluna — look a live boss up with `GetMapById()` + `GetUnitGUID(low, entry)` + `Map:GetWorldObject()`.
+- `IsManagedBossEntry`, `DEFAULT_SPAWN_POINTS` and `activeBossInfo` must be forward declared: references before their `local` declaration resolve to globals (`nil`).
+- `rebase` / `config reload` must recompute the base health from the template (`Creature:UpdateEntry()`, **out of combat** only — it resets the threat table); in combat fall back to `current / multiplier` so the multiplier never compounds.
+- `Unit:SetLevel()` only writes `UNIT_FIELD_LEVEL` and does not recompute creature stats; level-83 templates with real WotLK stat rows (`exp=2`) are required.
+- Contribution stats accumulate per boss guid and are released only on death settlement or `.boss clear`.
+- Config auras are tracked per guid and the difference is `RemoveAura`-ed on reload.
+- `print` is shadowed file-locally (`local print = BossLog`) — overriding the global `print` sends every later Eluna script's output into `boss.log`.
+- Logs rotate at 5 MB to `boss.log.<timestamp>.bak`; event/contributor text is truncated UTF-8-safely at the column width; an empty `SPAWN_POINTS` raises `math.random(0)` and needs an explicit guard.
+- Info-only subcommands (`.boss help`, `preset list`, `difficulty list`) must send their first line through `BossReply` so strict callers see the `[AGMP_OK]` / `[AGMP_ERROR]` marker.
+- `bossRewardedGUIDs` is cleared on death.
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 90+ invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values actually win over script defaults", `.boss clear` side effects, event registration, **the daily schedule (a controllable clock drives the 1 s tick: weekday masks, spawn inside a window, `schedule_close` on the way out, `.boss spawn` refused outside a window while `force` passes, plus automatic column migration on an old schema)**, **multi-realm binding (rewrite the constants and every DB-qualified statement must follow the new schema/state_key)**, and the two regressions above ("no global `print` override", "no leaked globals"). See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 160+ invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, the six reward pools (including a full `OnBossDied` payout run), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
@@ -218,23 +285,13 @@ A new realm gets its own row seeded with defaults (`INSERT IGNORE`) on first loa
 existing realm's activity config over, export that realm's row (`WHERE state_key = '<old key>'`),
 change the key in the dump and import it.
 
-`tools/boss-lua-smoke/smoke.lua` asserts this: the key is rewritten and the file is loaded again, and
-the event/contributor writes must carry the new key, the binding log must report it, and the shared
-schema name must stay unchanged — a hard-coded `'current'` anywhere fails the test.
-
 ## Standalone Mode (Without Web)
 
-This script is designed to run independently.
-
-- On load, Lua ensures database/table existence.
-- Config defaults are inserted by Lua if missing.
-- Runtime/event/contributor records are written by Lua only.
-
-No AGMP/Web dependency is required for core functionality.
+The script runs independently: Lua ensures database/table existence, inserts missing config
+defaults, and is the only writer of runtime/event/contributor records. No AGMP/Web dependency is
+required for core functionality.
 
 ## Using With AGMP Web Management
-
-This script is compatible with the AGMP Boss module.
 
 ### Responsibility Split
 
@@ -257,7 +314,8 @@ This script is compatible with the AGMP Boss module.
 - `boss_activity_config` contains a `spawn_points_text` column.
 - The panel writes the main table with `REPLACE INTO` (fixed column list) and the ext table with
   `INSERT ... ON DUPLICATE KEY UPDATE` (submitted columns only) — add a main-table column only
-  together with the panel code, an ext-table column is safe on its own.
+  together with the panel code; an ext-table column is safe on its own, but must be appended at the
+  end of both the Lua descriptor table and the panel's `ext_fields`.
 - SOAP account has permission to execute Boss commands.
 - `php tools/verify_boss_ext_page.php` cross-checks the panel's ext schema against `boss.lua`'s
   descriptor table and renders the page in both locales (81 checks).

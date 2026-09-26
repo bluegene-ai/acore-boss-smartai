@@ -1,53 +1,33 @@
 -- ============================================================================
 --  活动 Boss 专用模板（AGMP「Boss 活动管理」→ 难度档位）
---  文件：2026_09_23_activity_boss_tiers_190090_190093.sql
---  目标库：该区的 world 库（如 acore_world；多区时每个区一个）
---          末尾另含一次配置切换：共用库 `ac_eluna` + 主区 key `current`
+--  目标库：该区的 world 库（如 acore_world；多区时每个区一个）；
+--          末尾另含一次配置切换：共用库 ac_eluna + 主区 key current。
 --
---  ★ 多区注意：本文件末尾的 UPDATE 写死了 `ac_eluna`（共用库名）**和** `state_key = 'current'`
---    （主区那一行）。用在别的区时，必须把后者换成该区的 key，否则会去改主区的活动配置；
---    库名一般不用改（多区共用 ac_eluna）。正确做法：用 tools/deploy-realm.ps1
---    -ApplyTierSql <该区 world 库> -RuntimeKey <该区 key>，它会自动改写这两处后再导入。
+--  ★ 多区：末尾 UPDATE 写死了 ac_eluna 与 state_key='current'。用在别的区时**必须**换成该区 key，
+--    否则会改到主区配置。正确做法：tools/deploy-realm.ps1 -ApplyTierSql <该区 world 库> -RuntimeKey <该区 key>。
 --
---  为什么需要这个文件：
---    * 旧实现复用死亡矿井 Boss「绿皮队长」(entry 647)：该模板 AIName=SmartAI 且
---      smart_scripts 里有 2 条战斗施法（Cleave 40505 / Poisoned Harpoon 5208），
---      会与 Eluna 脚本形成双 AI，面板的技能预设管不到它们；
---    * 647 模板等级是 20/20，而 Unit:SetLevel 只写 UNIT_FIELD_LEVEL、不重算生物属性，
---      所以脚本里的 bossLevel=83 之前只是"显示等级"，血量全靠 boss_health_multiplier 硬拉。
---    本文件建立 4 个专用模板：无 AIName、无 smart_scripts、无掉落/金钱，
---    等级 83 + exp=2（真正吃 WotLK 数值行），强度只由 HealthModifier / DamageModifier 决定。
+--  建立 4 个专用模板（无 AIName、无 smart_scripts、无掉落/金钱，等级 83 + exp=2），
+--  强度只由 HealthModifier / DamageModifier 决定，避免复用 647 模板时与 Eluna 形成双 AI。
 --
---  ── 数值口径（改完执行 .reload creature_template 即生效，无需重启）──────────────
---    基准血量 H = creature_classlevelstats(level=83, class=1).basehp2(=13945)
---                 × HealthModifier × Rate.Creature.Elite.Elite.HP(=1)
---    实际血量   = H × boss_health_multiplier（ac_eluna.boss_activity_config，面板「血量倍率」）
---                 ★ 线上当前该值为 1500（不是默认 20），下表按 1500 计算
---    近战基伤   = creature_classlevelstats(level=83, class=1).damage_exp2(=177.07) × DamageModifier
---                 （注意：本 Boss 的威胁主要来自 Eluna 技能池的法术，近战只是次要旋钮）
---
+--  数值口径（改完 .reload creature_template 生效，无需重启）：
+--    基准血量 H = creature_classlevelstats(level=83, class=1).basehp2(13945) × HealthModifier × 1
+--    实际血量   = H × boss_health_multiplier（面板「血量倍率」，线上当前 1500，下表按 1500 计）
+--    近战基伤   = creature_classlevelstats(level=83, class=1).damage_exp2(177.07) × DamageModifier
 --    档位    entry    HealthModifier   基准H     实际血量(×1500)   DamageModifier  近战/击   rank  适用场景
---    入门    190090   0.21              2,928    ≈ 4,392,700      1.0             ≈177      1     与现网同级（现网≈4,356,000），单人/小队可达
+--    入门    190090   0.21              2,928    ≈ 4,392,700      1.0             ≈177      1     与现网同级，单人/小队可达
 --    标准    190091   0.60              8,367    ≈ 12,550,500     2.0             ≈354      1     5 人小队（80 级，约 10 分钟）
 --    困难    190092   1.45             20,220    ≈ 30,330,000     4.0             ≈708      3     10 人团
 --    团本    190093   3.60             50,202    ≈ 75,303,000     7.0             ≈1,239    3     25 人团 / 高压
+--    改某一档：UPDATE 该 entry 的 HealthModifier / DamageModifier 后 .reload creature_template；
+--    整体缩放改面板「血量倍率」。参考：WotLK 团本 Boss 的 HealthModifier 165–1250、DamageModifier 35–139。
 --
---    想改某一档：直接 UPDATE 该 entry 的 HealthModifier / DamageModifier，
---    然后 .reload creature_template；想整体缩放：改面板「血量倍率」即可。
---    参考：真实 WotLK 团本 Boss 的 HealthModifier 在 165–1250、DamageModifier 在 35–139
---    （Archavon 165/36.8、Toravon 330/107.3、Lich King 1250/139），需要那种量级时照抄即可。
---
---  用法（示例）：
---    "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h 127.0.0.1 -P 3306 -u root -p acore_world < 本文件
---    然后执行（游戏内 GM 或 AGMP 面板）: .reload creature_template
---    面板「Boss 活动管理 → 难度档位」选择档位并保存即写入 boss_activity_config.boss_entry。
+--  用法："C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h 127.0.0.1 -P 3306 -u root -p acore_world < 本文件
+--        然后 .reload creature_template；面板「难度档位」选择并保存即写入 boss_activity_config.boss_entry。
 -- ============================================================================
 
 -- 结构骨架：以 entry 647 复制，避免手写 56 个列而漏字段
 CREATE TEMPORARY TABLE IF NOT EXISTS `tmp_boss_tier` LIKE `creature_template`;
 
--- ---------------------------------------------------------------------------
--- 档位 1/4：190090 入门 —— 与现网同级
 -- ---------------------------------------------------------------------------
 DELETE FROM `tmp_boss_tier`;
 INSERT INTO `tmp_boss_tier` SELECT * FROM `creature_template` WHERE `entry` = 647;
@@ -81,8 +61,6 @@ DELETE FROM `creature_template` WHERE `entry` = 190090;
 INSERT INTO `creature_template` SELECT * FROM `tmp_boss_tier`;
 
 -- ---------------------------------------------------------------------------
--- 档位 2/4：190091 标准 —— 5 人小队
--- ---------------------------------------------------------------------------
 DELETE FROM `tmp_boss_tier`;
 INSERT INTO `tmp_boss_tier` SELECT * FROM `creature_template` WHERE `entry` = 647;
 UPDATE `tmp_boss_tier` SET
@@ -115,8 +93,6 @@ DELETE FROM `creature_template` WHERE `entry` = 190091;
 INSERT INTO `creature_template` SELECT * FROM `tmp_boss_tier`;
 
 -- ---------------------------------------------------------------------------
--- 档位 3/4：190092 困难 —— 10 人团
--- ---------------------------------------------------------------------------
 DELETE FROM `tmp_boss_tier`;
 INSERT INTO `tmp_boss_tier` SELECT * FROM `creature_template` WHERE `entry` = 647;
 UPDATE `tmp_boss_tier` SET
@@ -148,8 +124,6 @@ UPDATE `tmp_boss_tier` SET
 DELETE FROM `creature_template` WHERE `entry` = 190092;
 INSERT INTO `creature_template` SELECT * FROM `tmp_boss_tier`;
 
--- ---------------------------------------------------------------------------
--- 档位 4/4：190093 团本 —— 25 人团 / 高压
 -- ---------------------------------------------------------------------------
 DELETE FROM `tmp_boss_tier`;
 INSERT INTO `tmp_boss_tier` SELECT * FROM `creature_template` WHERE `entry` = 647;
@@ -185,8 +159,6 @@ INSERT INTO `creature_template` SELECT * FROM `tmp_boss_tier`;
 DROP TEMPORARY TABLE IF EXISTS `tmp_boss_tier`;
 
 -- ---------------------------------------------------------------------------
--- 模型：沿用旧模板外观（显示 7113）；实际体型由面板「体型缩放」控制
--- ---------------------------------------------------------------------------
 DELETE FROM `creature_template_model` WHERE `CreatureID` IN (190090, 190091, 190092, 190093);
 INSERT INTO `creature_template_model`
     (`CreatureID`, `Idx`, `CreatureDisplayID`, `DisplayScale`, `Probability`, `VerifiedBuild`)
@@ -210,16 +182,12 @@ WHERE a.`entry` = 647;
 --             creature_template_locale（避免沿用"绿皮队长"的本地化名字）
 
 -- ---------------------------------------------------------------------------
--- 把线上活动 Boss 切到「入门」档（其余配置原样保留：倍率 1500、体型 9.99、技能池、奖励等）
--- ---------------------------------------------------------------------------
 UPDATE `ac_eluna`.`boss_activity_config`
 SET `boss_entry` = 190090,
     `boss_name`  = '送财童子',
     `updated_at` = UNIX_TIMESTAMP()
 WHERE `state_key` = 'current';
 
--- ---------------------------------------------------------------------------
--- 回读校验
 -- ---------------------------------------------------------------------------
 SELECT `entry`, `name`, `subname`, `minlevel`, `maxlevel`, `exp`, `rank`,
        `HealthModifier`, `DamageModifier`, `AIName`, `ScriptName`, `lootid`,
