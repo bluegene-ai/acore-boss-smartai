@@ -205,32 +205,32 @@ local BOSS_CONFIG = {
             ["冰霜新星"] = "冻在原地！",
             ["战车冲撞"] = "撞翻你们！",
             ["熔化护甲"] = "你的护甲像纸一样！",
-            ["音波尖啸"] = "奥能爆裂！",
+            ["音速尖啸"] = "奥能爆裂！",
             ["岩石碎片"] = "碎石会自己找上你们！",
             ["践踏"] = "站稳了，地面要塌了！",
             ["穿刺"] = "这一击，穿心！",
-            ["穿刺顺劈"] = "近身就是找死！",
-            ["骇人咆哮"] = "在恐惧里四散奔逃吧！",
-            ["剧毒新星"] = "毒雾会淹没你们！",
-            ["毒液箭"] = "这一箭，带毒！",
-            ["灼烧吐息"] = "呼吸之间，尽是焦土！",
-            ["烈焰余烬"] = "脚下的火，可不会等你！",
-            ["陨星拳"] = "拳头落下时，别怪我没提醒！",
-            ["冰冻之地"] = "脚下结冰了，快动！",
-            ["白茫"] = "看不见路？那就死在风雪里！",
-            ["剧毒废料"] = "废料漫开了，别往里踩！",
+            ["刺骨挥砍"] = "近身就是找死！",
+            ["恐惧咆哮"] = "在恐惧里四散奔逃吧！",
+            ["毒性新星"] = "毒雾会淹没你们！",
+            ["毒箭"] = "这一箭，带毒！",
+            ["灼热吐息"] = "呼吸之间，尽是焦土！",
+            ["余烬"] = "脚下的火，可不会等你！",
+            ["流星拳"] = "拳头落下时，别怪我没提醒！",
+            ["大地冰封"] = "脚下结冰了，快动！",
+            ["霜至"] = "看不见路？那就死在风雪里！",
+            ["剧毒废渣"] = "废料漫开了，别往里踩！",
             ["死亡凋零"] = "死亡会从你们脚下蔓延！",
-            ["暗影冲击"] = "黑暗正从天上砸下来！",
-            ["冰焰"] = "冰与火的轨迹，会把你们切开！",
-            ["软泥抛掷"] = "接住这团烂东西吧！",
-            ["无面者印记"] = "被标记的人，离队友远一点！",
-            ["骨刃分劈"] = "靠近我的人，全都一起受死！",
-            ["恐惧尖啸"] = "尖叫会撕开你们的阵型！",
-            ["冰霜箭雨"] = "寒霜会覆盖你们所有人！",
-            ["无意义之触"] = "你的存在，连威胁都算不上！",
-            ["灼烧烈焰"] = "烈焰会把你们的法术和护甲一起烧穿！",
-            ["哨兵震爆"] = "法术还没读完？先吃下这一下！",
-            ["黑暗奔涌"] = "黑暗在我体内暴涨，你们挡不住！",
+            ["暗影撞击"] = "黑暗正从天上砸下来！",
+            ["冷焰"] = "冰与火的轨迹，会把你们切开！",
+            ["可延展黏液"] = "接住这团烂东西吧！",
+            ["无面者的印记"] = "被标记的人，离队友远一点！",
+            ["军刀猛刺"] = "靠近我的人，全都一起受死！",
+            ["惊骇尖啸"] = "尖叫会撕开你们的阵型！",
+            ["寒冰箭雨"] = "寒霜会覆盖你们所有人！",
+            ["蔑视之触"] = "你的存在，连威胁都算不上！",
+            ["灼热烈焰"] = "烈焰会把你们的法术和护甲一起烧穿！",
+            ["警戒冲击"] = "法术还没读完？先吃下这一下！",
+            ["黑暗涌动"] = "黑暗在我体内暴涨，你们挡不住！",
             ["暗影陷阱"] = "别站那儿！",
             ["死亡符文"] = "别踩符文！",
             ["吞噬烈焰"] = "火舌舔地！",
@@ -317,6 +317,25 @@ local BOSS_CONFIG = {
             ["碎阵压锋"] = "先碎掉你们前排，再碾过去！",
             ["破法齐射"] = "法师们，抬头看看是谁在猎杀你们！",
             ["黑潮封咏"] = "黑潮已起，谁都别想完整读完一个法术！",
+            -- 2026-09 扩充：每个预设 +3 条连招（法术全部取自 WLK 团本，经 Spell.dbc + 冒烟测试校验）
+            ["雷链锁阵"] = "雷链已经连上，谁先动谁先死！",
+            ["崩岩压顶"] = "山岩压顶，你们连站的地方都没有！",
+            ["风暴终判"] = "风暴收尾，你们的回合到此为止！",
+            ["引燃起手"] = "先点火，剩下的慢慢算！",
+            ["熔渣回火"] = "踩过我的火，就得付代价！",
+            ["焚世终章"] = "整片场地都在烧，你们无处可退！",
+            ["寒径封路"] = "脚下已经结冰，跑起来给我看看！",
+            ["霜锁窒压"] = "风雪封住你们的视线，也封住退路！",
+            ["极寒终末"] = "最后一场雪，为你们而下！",
+            ["毒牙起手"] = "毒已经进血了，慢慢体会！",
+            ["疫雾围猎"] = "毒雾围起来，谁也别想单独跑！",
+            ["绞毒收猎"] = "猎物跑累了，就该收网！",
+            ["冥火点名"] = "被点到名字的，自己走进坟里！",
+            ["尸爆连环"] = "一个接一个，别急！",
+            ["墓穴终焉"] = "坟已经挖好，躺进去吧！",
+            ["碎甲起锋"] = "先碎你们的甲，再谈反抗！",
+            ["静默围杀"] = "念不出法术的感觉，好好享受！",
+            ["反咒终章"] = "你们的法术，一个都别想落地！",
         },
         
         -- 战斗时间过长嘲讽
@@ -354,8 +373,8 @@ local BOSS_CONFIG = {
     phase2SummonCountMin = 1,          -- 二阶段召唤小怪数量（最小）
     phase2SummonCountMax = 2,          -- 二阶段召唤小怪数量（最大）
     phase3SummonCount = 2,             -- 三阶段召唤小怪数量
-    phase2SpellId = 1044,              -- 二阶段自身法术（1044=自由祝福，0=不施放）
-    phase3SpellId = 8599,              -- 三阶段自身法术（8599=狂暴，0=不施放）
+    phase2SpellId = 1044,              -- 二阶段自身法术（1044=自由之手，0=不施放）
+    phase3SpellId = 8599,              -- 三阶段自身法术（8599=激怒，0=不施放）
 
     -- ---- [patrol] 巡逻 ----
     patrolEnabled = true,              -- Boss 脱战时是否在刷新点附近巡逻
@@ -1292,28 +1311,38 @@ local SKILL_PRESET_LIBRARY = {
         summary = "雷电跳跃配合震荡与点名压制，强调分散站位和中场转火。",
         skillPools = {
             [1] = {
-                {spellId = 64213, name = "闪电链", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"}, -- Emalon
-                {spellId = 58678, name = "岩石碎片", minCD = 13, maxCD = 18, target = "victim", priority = 7, condition = "ranged_target"}, -- Archavon
-                {spellId = 58663, name = "践踏", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "multi_melee"}, -- Archavon
-                {spellId = 48878, name = "穿刺顺劈", minCD = 14, maxCD = 20, target = "victim", priority = 6, condition = "multi_melee"}, -- Dred
+                {spellId = 64213, name = "闪电链", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"}, -- Emalon / 阿尔卡冯的宝库(VoA)
+                {spellId = 58678, name = "岩石碎片", minCD = 13, maxCD = 18, target = "victim", priority = 7, condition = "ranged_target"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 58663, name = "践踏", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "multi_melee"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 48878, name = "刺骨挥砍", minCD = 14, maxCD = 20, target = "victim", priority = 6, condition = "multi_melee"}, -- King Dred / 达克萨隆要塞(5人本)
+                -- 2026-09 从 WLK 团本补充（name = Spell.dbc enCN 名称逐字校验；来源 Boss 见行尾注释）
+                {spellId = 67648, name = "震地践踏", minCD = 16, maxCD = 22, target = "self", priority = 8, condition = "many_attackers"}, -- ToC 穿刺者戈莫克
+                {spellId = 70309, name = "撕裂投掷", minCD = 13, maxCD = 18, target = "victim", priority = 7, condition = "multi_melee"}, -- ICC 炮舰战
             },
             [2] = {
-                {spellId = 64216, name = "闪电新星", minCD = 14, maxCD = 20, target = "self", priority = 8, condition = "multi_target"}, -- Emalon
-                {spellId = 64422, name = "音波尖啸", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "caster_target"}, -- Auriaya
-                {spellId = 58666, name = "穿刺", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "low_hp_target"}, -- Archavon
-                {spellId = 48849, name = "骇人咆哮", minCD = 20, maxCD = 28, target = "self", priority = 5, condition = "many_attackers"}, -- Dred
+                {spellId = 64216, name = "闪电新星", minCD = 14, maxCD = 20, target = "self", priority = 8, condition = "multi_target"}, -- Emalon / 阿尔卡冯的宝库(VoA)
+                {spellId = 64422, name = "音速尖啸", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "caster_target"}, -- Auriaya / 奥杜尔(Ulduar)
+                {spellId = 58666, name = "穿刺", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "low_hp_target"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 48849, name = "恐惧咆哮", minCD = 20, maxCD = 28, target = "self", priority = 5, condition = "many_attackers"}, -- King Dred / 达克萨隆要塞(5人本)
+                {spellId = 61911, name = "静电瓦解", minCD = 14, maxCD = 20, target = "victim", priority = 8, condition = "ranged_target"}, -- Ulduar 钢铁议会
+                {spellId = 69651, name = "致伤打击", minCD = 15, maxCD = 21, target = "victim", priority = 7, condition = "healer_target"}, -- ICC 炮舰战
             },
             [3] = {
                 {spellId = 64216, name = "闪电新星", minCD = 12, maxCD = 18, target = "self", priority = 8, condition = "multi_target"},
                 {spellId = 58678, name = "岩石碎片", minCD = 10, maxCD = 16, target = "victim", priority = 7, condition = "grouped_targets"},
                 {spellId = 58666, name = "穿刺", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "healer_target"},
-                {spellId = 64422, name = "音波尖啸", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "multi_target"},
+                {spellId = 64422, name = "音速尖啸", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "multi_target"},
+                {spellId = 62325, name = "大地震颤", minCD = 18, maxCD = 26, target = "self", priority = 8, condition = "caster_target"}, -- Ulduar 弗蕾亚：物理 AoE + 群体沉默
             },
         },
         comboChains = {
             {name = "雷岩合围", skills = {{64213, "victim"}, {58678, "victim"}, {64216, "self"}}, cooldown = 28, triggerChance = 38, phase = {1, 2}},
             {name = "重压处决", skills = {{58663, "self"}, {58666, "victim"}, {64422, "self"}}, cooldown = 30, triggerChance = 35, phase = {2, 3}},
             {name = "恐惧清场", skills = {{48849, "self"}, {64216, "self"}, {58678, "victim"}}, cooldown = 34, triggerChance = 32, phase = {3}},
+            -- 2026-09 扩充（每条 3 个技能；中段为本次新增的 WLK 团本法术，全部在本预设池内）
+            {name = "雷链锁阵", skills = {{64213, "victim"}, {67648, "self"}, {58666, "victim"}}, cooldown = 26, triggerChance = 38, phase = {1, 2}},
+            {name = "崩岩压顶", skills = {{58663, "self"}, {70309, "victim"}, {64216, "self"}}, cooldown = 30, triggerChance = 36, phase = {1, 2}},
+            {name = "风暴终判", skills = {{64216, "self"}, {62325, "self"}, {58666, "victim"}}, cooldown = 28, triggerChance = 42, phase = {3}},
         },
         openingSkills = {
             {spellId = 64213, name = "闪电链", target = "victim"},
@@ -1328,68 +1357,85 @@ local SKILL_PRESET_LIBRARY = {
         summary = "火焰点名、持续场压和近战爆发并存，适合制造强走位与治疗压力。",
         skillPools = {
             [1] = {
-                {spellId = 66681, name = "烈焰余烬", minCD = 9, maxCD = 14, target = "victim", priority = 7, condition = "ranged_target"}, -- Koralon
-                {spellId = 69024, name = "剧毒废料", minCD = 11, maxCD = 16, target = "victim", priority = 6, condition = "grouped_targets"}, -- Krick/Ick
-                {spellId = 64213, name = "闪电链", minCD = 13, maxCD = 18, target = "victim", priority = 6, condition = "grouped_targets"}, -- Emalon
-                {spellId = 66725, name = "陨星拳", minCD = 18, maxCD = 24, target = "self", priority = 5, condition = "multi_melee"}, -- Koralon
+                {spellId = 66681, name = "余烬", minCD = 9, maxCD = 14, target = "victim", priority = 7, condition = "ranged_target"}, -- Koralon / 阿尔卡冯的宝库(VoA)
+                {spellId = 69024, name = "剧毒废渣", minCD = 11, maxCD = 16, target = "victim", priority = 6, condition = "grouped_targets"}, -- Krick/Ick / 萨隆矿坑(5人本)
+                {spellId = 64213, name = "闪电链", minCD = 13, maxCD = 18, target = "victim", priority = 6, condition = "grouped_targets"}, -- Emalon / 阿尔卡冯的宝库(VoA)
+                {spellId = 66725, name = "流星拳", minCD = 18, maxCD = 24, target = "self", priority = 5, condition = "multi_melee"}, -- Koralon / 阿尔卡冯的宝库(VoA)
+                {spellId = 63666, name = "凝固汽油炸弹", minCD = 12, maxCD = 17, target = "victim", priority = 7, condition = "ranged_target"}, -- Ulduar 米米尔隆
             },
             [2] = {
-                {spellId = 66665, name = "灼烧吐息", minCD = 12, maxCD = 18, target = "self", priority = 8, condition = "multi_target"}, -- Koralon
-                {spellId = 64216, name = "闪电新星", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "multi_target"}, -- Emalon
-                {spellId = 58663, name = "践踏", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "multi_melee"}, -- Archavon
-                {spellId = 58666, name = "穿刺", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "low_hp_target"}, -- Archavon
+                {spellId = 66665, name = "灼热吐息", minCD = 12, maxCD = 18, target = "self", priority = 8, condition = "multi_target"}, -- Koralon / 阿尔卡冯的宝库(VoA)
+                {spellId = 64216, name = "闪电新星", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "multi_target"}, -- Emalon / 阿尔卡冯的宝库(VoA)
+                {spellId = 58663, name = "践踏", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "multi_melee"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 58666, name = "穿刺", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "low_hp_target"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 66528, name = "魔能闪电", minCD = 13, maxCD = 18, target = "victim", priority = 7, condition = "grouped_targets"}, -- ToC 加拉克苏斯大王：链式闪电
+                {spellId = 64533, name = "热浪", minCD = 18, maxCD = 24, target = "self", priority = 7, condition = "multi_target"}, -- Ulduar 米米尔隆
             },
             [3] = {
-                {spellId = 66665, name = "灼烧吐息", minCD = 10, maxCD = 16, target = "self", priority = 8, condition = "multi_target"},
-                {spellId = 66725, name = "陨星拳", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "multi_melee"},
-                {spellId = 66681, name = "烈焰余烬", minCD = 8, maxCD = 12, target = "victim", priority = 7, condition = "healer_target"},
-                {spellId = 69024, name = "剧毒废料", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 66665, name = "灼热吐息", minCD = 10, maxCD = 16, target = "self", priority = 8, condition = "multi_target"},
+                {spellId = 66725, name = "流星拳", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "multi_melee"},
+                {spellId = 66681, name = "余烬", minCD = 8, maxCD = 12, target = "victim", priority = 7, condition = "healer_target"},
+                {spellId = 69024, name = "剧毒废渣", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 71393, name = "烈焰", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "many_attackers"}, -- ICC 塔达拉姆王子
+                {spellId = 62680, name = "烈焰喷射", minCD = 25, maxCD = 32, target = "self", priority = 8, condition = "multi_melee"}, -- Ulduar 伊格尼斯：击飞+沉默+DoT，长 CD 阶段技
             },
         },
         comboChains = {
             {name = "灰烬逼走", skills = {{66681, "victim"}, {69024, "victim"}, {64216, "self"}}, cooldown = 26, triggerChance = 40, phase = {1, 2}},
             {name = "烈拳处决", skills = {{66725, "self"}, {58663, "self"}, {58666, "victim"}}, cooldown = 30, triggerChance = 34, phase = {2, 3}},
             {name = "焚场风暴", skills = {{66665, "self"}, {66681, "victim"}, {69024, "victim"}}, cooldown = 32, triggerChance = 38, phase = {3}},
+            -- 2026-09 扩充（每条 3 个技能；中段为本次新增的 WLK 团本法术）
+            {name = "引燃起手", skills = {{66681, "victim"}, {63666, "victim"}, {69024, "victim"}}, cooldown = 24, triggerChance = 40, phase = {1}},
+            {name = "熔渣回火", skills = {{66665, "self"}, {66528, "victim"}, {58666, "victim"}}, cooldown = 30, triggerChance = 36, phase = {2}},
+            {name = "焚世终章", skills = {{66665, "self"}, {62680, "self"}, {71393, "self"}}, cooldown = 32, triggerChance = 38, phase = {3}},
         },
         openingSkills = {
-            {spellId = 66681, name = "烈焰余烬", target = "victim"},
-            {spellId = 69024, name = "剧毒废料", target = "victim"},
-            {spellId = 66725, name = "陨星拳", target = "self"},
+            {spellId = 66681, name = "余烬", target = "victim"},
+            {spellId = 69024, name = "剧毒废渣", target = "victim"},
+            {spellId = 66725, name = "流星拳", target = "self"},
         },
     },
 
     -- 冰封压境：慢性减速和大范围白茫叠压，适合强化治疗与换位节奏。
     frost_whiteout = {
         displayName = "冰封压境",
-        summary = "地面减速、全团白茫和法系压制叠加，后期会逼迫队伍持续换位。",
+        summary = "地面减速、全团冰霜压制与法系削弱叠加，后期会逼迫队伍持续换位。",
         skillPools = {
             [1] = {
-                {spellId = 72090, name = "冰冻之地", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "ranged_target"}, -- Toravon
-                {spellId = 64213, name = "闪电链", minCD = 12, maxCD = 18, target = "victim", priority = 6, condition = "grouped_targets"}, -- Emalon
-                {spellId = 54970, name = "毒液箭", minCD = 11, maxCD = 16, target = "victim", priority = 6, condition = "caster_target"}, -- Slad'ran
-                {spellId = 58663, name = "践踏", minCD = 18, maxCD = 24, target = "self", priority = 5, condition = "multi_melee"}, -- Archavon
+                {spellId = 72090, name = "大地冰封", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "ranged_target"}, -- Toravon / 阿尔卡冯的宝库(VoA)
+                {spellId = 64213, name = "闪电链", minCD = 12, maxCD = 18, target = "victim", priority = 6, condition = "grouped_targets"}, -- Emalon / 阿尔卡冯的宝库(VoA)
+                {spellId = 54970, name = "毒箭", minCD = 11, maxCD = 16, target = "victim", priority = 6, condition = "caster_target"}, -- Slad'ran / 古达克(5人本)
+                {spellId = 58663, name = "践踏", minCD = 18, maxCD = 24, target = "self", priority = 5, condition = "multi_melee"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 62469, name = "冰冻", minCD = 14, maxCD = 20, target = "victim", priority = 7, condition = "ranged_target"}, -- Ulduar 霍迪尔：点名定身 10s
             },
             [2] = {
-                {spellId = 72034, name = "白茫", minCD = 18, maxCD = 24, target = "self", priority = 8, condition = "multi_target"}, -- Toravon
-                {spellId = 72090, name = "冰冻之地", minCD = 12, maxCD = 17, target = "victim", priority = 7, condition = "grouped_targets"},
-                {spellId = 64422, name = "音波尖啸", minCD = 16, maxCD = 22, target = "self", priority = 6, condition = "caster_target"},
-                {spellId = 55081, name = "剧毒新星", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "multi_target"}, -- Slad'ran
+                {spellId = 72034, name = "霜至", minCD = 18, maxCD = 24, target = "self", priority = 8, condition = "multi_target"}, -- Toravon / 阿尔卡冯的宝库(VoA)
+                {spellId = 72090, name = "大地冰封", minCD = 12, maxCD = 17, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 64422, name = "音速尖啸", minCD = 16, maxCD = 22, target = "self", priority = 6, condition = "caster_target"},
+                {spellId = 55081, name = "毒性新星", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "multi_target"}, -- Slad'ran / 古达克(5人本)
+                {spellId = 62580, name = "寒冰箭雨", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "multi_target"}, -- Ulduar 托里姆：自身 AoE + 群体减速
+                {spellId = 67767, name = "冰霜疫病", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "caster_target"}, -- ICC 亡语者女士随从
             },
             [3] = {
-                {spellId = 72034, name = "白茫", minCD = 14, maxCD = 20, target = "self", priority = 8, condition = "multi_target"},
-                {spellId = 72090, name = "冰冻之地", minCD = 10, maxCD = 14, target = "victim", priority = 8, condition = "healer_target"},
-                {spellId = 55081, name = "剧毒新星", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "many_attackers"},
+                {spellId = 72034, name = "霜至", minCD = 14, maxCD = 20, target = "self", priority = 8, condition = "multi_target"},
+                {spellId = 72090, name = "大地冰封", minCD = 10, maxCD = 14, target = "victim", priority = 8, condition = "healer_target"},
+                {spellId = 55081, name = "毒性新星", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "many_attackers"},
                 {spellId = 58666, name = "穿刺", minCD = 10, maxCD = 16, target = "victim", priority = 7, condition = "low_hp_target"},
+                {spellId = 71380, name = "寒冰冲击", minCD = 15, maxCD = 21, target = "victim", priority = 8, condition = "grouped_targets"}, -- ICC 霜牙：地面减速 -76%
             },
         },
         comboChains = {
             {name = "冰雷点杀", skills = {{72090, "victim"}, {64213, "victim"}, {58666, "victim"}}, cooldown = 26, triggerChance = 36, phase = {1, 2}},
             {name = "白茫封场", skills = {{72034, "self"}, {55081, "self"}, {64422, "self"}}, cooldown = 32, triggerChance = 35, phase = {2, 3}},
             {name = "寒毒压溃", skills = {{72090, "victim"}, {72034, "self"}, {58663, "self"}}, cooldown = 30, triggerChance = 38, phase = {3}},
+            -- 2026-09 扩充（每条 3 个技能；中段为本次新增的 WLK 团本法术）
+            {name = "寒径封路", skills = {{72090, "victim"}, {62469, "victim"}, {58663, "self"}}, cooldown = 26, triggerChance = 38, phase = {1}},
+            {name = "霜锁窒压", skills = {{72034, "self"}, {67767, "victim"}, {58666, "victim"}}, cooldown = 30, triggerChance = 35, phase = {2, 3}},
+            {name = "极寒终末", skills = {{72034, "self"}, {71380, "victim"}, {55081, "self"}}, cooldown = 28, triggerChance = 40, phase = {3}},
         },
         openingSkills = {
-            {spellId = 72090, name = "冰冻之地", target = "victim"},
-            {spellId = 54970, name = "毒液箭", target = "victim"},
+            {spellId = 72090, name = "大地冰封", target = "victim"},
+            {spellId = 54970, name = "毒箭", target = "victim"},
             {spellId = 64213, name = "闪电链", target = "victim"},
         },
     },
@@ -1400,21 +1446,26 @@ local SKILL_PRESET_LIBRARY = {
         summary = "以毒伤、恐惧和近战斩杀构成压迫链，适合打出频繁转火和收割节奏。",
         skillPools = {
             [1] = {
-                {spellId = 54970, name = "毒液箭", minCD = 8, maxCD = 13, target = "victim", priority = 7, condition = "caster_target"}, -- Slad'ran
-                {spellId = 48878, name = "穿刺顺劈", minCD = 12, maxCD = 17, target = "victim", priority = 6, condition = "multi_melee"}, -- Dred
-                {spellId = 69024, name = "剧毒废料", minCD = 12, maxCD = 18, target = "victim", priority = 6, condition = "grouped_targets"}, -- Krick/Ick
-                {spellId = 58678, name = "岩石碎片", minCD = 14, maxCD = 20, target = "victim", priority = 6, condition = "ranged_target"}, -- Archavon
+                {spellId = 54970, name = "毒箭", minCD = 8, maxCD = 13, target = "victim", priority = 7, condition = "caster_target"}, -- Slad'ran / 古达克(5人本)
+                {spellId = 48878, name = "刺骨挥砍", minCD = 12, maxCD = 17, target = "victim", priority = 6, condition = "multi_melee"}, -- King Dred / 达克萨隆要塞(5人本)
+                {spellId = 69024, name = "剧毒废渣", minCD = 12, maxCD = 18, target = "victim", priority = 6, condition = "grouped_targets"}, -- Krick/Ick / 萨隆矿坑(5人本)
+                {spellId = 58678, name = "岩石碎片", minCD = 14, maxCD = 20, target = "victim", priority = 6, condition = "ranged_target"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 55604, name = "死亡疫病", minCD = 10, maxCD = 15, target = "victim", priority = 6, condition = "multi_melee"}, -- Naxx 收割者戈提克
+                {spellId = 66880, name = "酸液喷吐", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "caster_target"}, -- ToC 酸喉
             },
             [2] = {
-                {spellId = 55081, name = "剧毒新星", minCD = 15, maxCD = 21, target = "self", priority = 8, condition = "multi_target"}, -- Slad'ran
-                {spellId = 48849, name = "骇人咆哮", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "many_attackers"}, -- Dred
-                {spellId = 64422, name = "音波尖啸", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "caster_target"}, -- Auriaya
-                {spellId = 58666, name = "穿刺", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "low_hp_target"}, -- Archavon
+                {spellId = 55081, name = "毒性新星", minCD = 15, maxCD = 21, target = "self", priority = 8, condition = "multi_target"}, -- Slad'ran / 古达克(5人本)
+                {spellId = 48849, name = "恐惧咆哮", minCD = 18, maxCD = 24, target = "self", priority = 6, condition = "many_attackers"}, -- King Dred / 达克萨隆要塞(5人本)
+                {spellId = 64422, name = "音速尖啸", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "caster_target"}, -- Auriaya / 奥杜尔(Ulduar)
+                {spellId = 58666, name = "穿刺", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "low_hp_target"}, -- Archavon / 阿尔卡冯的宝库(VoA)
+                {spellId = 29484, name = "蛛网喷射", minCD = 18, maxCD = 24, target = "self", priority = 7, condition = "many_attackers"}, -- Naxx 迈克斯纳：群体昏迷
+                {spellId = 69240, name = "邪恶毒气", minCD = 13, maxCD = 18, target = "victim", priority = 7, condition = "grouped_targets"}, -- ICC 腐面：毒云 + 困惑
+                {spellId = 65926, name = "致死打击", minCD = 15, maxCD = 21, target = "victim", priority = 8, condition = "healer_target"}, -- ICC 达尔纳文：治疗 -51%
             },
             [3] = {
-                {spellId = 55081, name = "剧毒新星", minCD = 13, maxCD = 18, target = "self", priority = 8, condition = "multi_target"},
-                {spellId = 69024, name = "剧毒废料", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"},
-                {spellId = 48849, name = "骇人咆哮", minCD = 16, maxCD = 24, target = "self", priority = 6, condition = "many_attackers"},
+                {spellId = 55081, name = "毒性新星", minCD = 13, maxCD = 18, target = "self", priority = 8, condition = "multi_target"},
+                {spellId = 69024, name = "剧毒废渣", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 48849, name = "恐惧咆哮", minCD = 16, maxCD = 24, target = "self", priority = 6, condition = "many_attackers"},
                 {spellId = 58666, name = "穿刺", minCD = 10, maxCD = 15, target = "victim", priority = 8, condition = "healer_target"},
             },
         },
@@ -1422,10 +1473,14 @@ local SKILL_PRESET_LIBRARY = {
             {name = "毒刃收口", skills = {{54970, "victim"}, {48878, "victim"}, {58666, "victim"}}, cooldown = 24, triggerChance = 40, phase = {1, 2}},
             {name = "毒雾驱散", skills = {{69024, "victim"}, {55081, "self"}, {48849, "self"}}, cooldown = 30, triggerChance = 34, phase = {2, 3}},
             {name = "猎杀终曲", skills = {{64422, "self"}, {58666, "victim"}, {55081, "self"}}, cooldown = 28, triggerChance = 40, phase = {3}},
+            -- 2026-09 扩充（每条 3 个技能；中段为本次新增的 WLK 团本法术）
+            {name = "毒牙起手", skills = {{66880, "victim"}, {55604, "victim"}, {48878, "victim"}}, cooldown = 24, triggerChance = 40, phase = {1}},
+            {name = "疫雾围猎", skills = {{69240, "victim"}, {29484, "self"}, {58666, "victim"}}, cooldown = 28, triggerChance = 36, phase = {2, 3}},
+            {name = "绞毒收猎", skills = {{65926, "victim"}, {55081, "self"}, {58666, "victim"}}, cooldown = 30, triggerChance = 42, phase = {2, 3}},
         },
         openingSkills = {
-            {spellId = 54970, name = "毒液箭", target = "victim"},
-            {spellId = 69024, name = "剧毒废料", target = "victim"},
+            {spellId = 54970, name = "毒箭", target = "victim"},
+            {spellId = 69024, name = "剧毒废渣", target = "victim"},
             {spellId = 58678, name = "岩石碎片", target = "victim"},
         },
     },
@@ -1433,72 +1488,90 @@ local SKILL_PRESET_LIBRARY = {
     -- 墓火轰炸：选用 ICC 与 Ulduar 的纯战斗法术，主打点名爆发、投射物和地面覆盖。
     grave_bombard = {
         displayName = "墓火轰炸",
-        summary = "死亡凋零、冰焰与暗影冲击持续封位，配合软泥抛掷和无面者印记打出点名爆发。",
+        summary = "地面封位、暗影点名与延迟爆发交替，主打投射物与场地覆盖。",
         skillPools = {
             [1] = {
-                {spellId = 71001, name = "死亡凋零", minCD = 11, maxCD = 16, target = "victim", priority = 7, condition = "grouped_targets"}, -- Lady Deathwhisper
-                {spellId = 62660, name = "暗影冲击", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "ranged_target"}, -- General Vezax
-                {spellId = 69140, name = "冰焰", minCD = 14, maxCD = 20, target = "victim", priority = 6, condition = "ranged_target"}, -- Lord Marrowgar
-                {spellId = 70852, name = "软泥抛掷", minCD = 15, maxCD = 20, target = "victim", priority = 6, condition = "caster_target"}, -- Professor Putricide
+                {spellId = 71001, name = "死亡凋零", minCD = 11, maxCD = 16, target = "victim", priority = 7, condition = "grouped_targets"}, -- Lady Deathwhisper / 冰冠堡垒(ICC)
+                {spellId = 62660, name = "暗影撞击", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "ranged_target"}, -- General Vezax / 奥杜尔(Ulduar)
+                {spellId = 69140, name = "冷焰", minCD = 14, maxCD = 20, target = "victim", priority = 6, condition = "ranged_target"}, -- Lord Marrowgar
+                {spellId = 70852, name = "可延展黏液", minCD = 15, maxCD = 20, target = "victim", priority = 6, condition = "caster_target"}, -- Professor Putricide / 冰冠堡垒(ICC)
+                {spellId = 27810, name = "暗影裂隙", minCD = 12, maxCD = 17, target = "victim", priority = 7, condition = "grouped_targets"}, -- Naxx 克尔苏加德：地面封位
+                {spellId = 70594, name = "死寒之箭", minCD = 11, maxCD = 16, target = "victim", priority = 7, condition = "caster_target"}, -- ICC 亡语者女士
             },
             [2] = {
                 {spellId = 71001, name = "死亡凋零", minCD = 10, maxCD = 15, target = "victim", priority = 8, condition = "grouped_targets"},
-                {spellId = 63276, name = "无面者印记", minCD = 18, maxCD = 24, target = "victim", priority = 7, condition = "multi_target"}, -- General Vezax
-                {spellId = 69140, name = "冰焰", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "healer_target"},
-                {spellId = 70852, name = "软泥抛掷", minCD = 13, maxCD = 18, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 63276, name = "无面者的印记", minCD = 18, maxCD = 24, target = "victim", priority = 7, condition = "multi_target"}, -- General Vezax / 奥杜尔(Ulduar)
+                {spellId = 69140, name = "冷焰", minCD = 12, maxCD = 18, target = "victim", priority = 7, condition = "healer_target"},
+                {spellId = 70852, name = "可延展黏液", minCD = 13, maxCD = 18, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 64157, name = "厄运诅咒", minCD = 14, maxCD = 20, target = "victim", priority = 7, condition = "caster_target"}, -- Ulduar 尤格-萨隆：延迟暗影爆发
+                {spellId = 71237, name = "麻痹诅咒", minCD = 14, maxCD = 20, target = "victim", priority = 7, condition = "caster_target"}, -- ICC 亡语者女士：技能冷却 +15%
             },
             [3] = {
                 {spellId = 71001, name = "死亡凋零", minCD = 9, maxCD = 13, target = "victim", priority = 8, condition = "grouped_targets"},
-                {spellId = 62660, name = "暗影冲击", minCD = 9, maxCD = 13, target = "victim", priority = 8, condition = "healer_target"},
-                {spellId = 63276, name = "无面者印记", minCD = 16, maxCD = 22, target = "victim", priority = 7, condition = "multi_target"},
-                {spellId = 69140, name = "冰焰", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 62660, name = "暗影撞击", minCD = 9, maxCD = 13, target = "victim", priority = 8, condition = "healer_target"},
+                {spellId = 63276, name = "无面者的印记", minCD = 16, maxCD = 22, target = "victim", priority = 7, condition = "multi_target"},
+                {spellId = 69140, name = "冷焰", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "grouped_targets"},
+                {spellId = 63038, name = "黑暗箭雨", minCD = 16, maxCD = 22, target = "self", priority = 8, condition = "multi_target"}, -- Ulduar 尤格-萨隆：暗影 AoE + 降低治疗
             },
         },
         comboChains = {
             {name = "墓地封锁", skills = {{71001, "victim"}, {69140, "victim"}, {62660, "victim"}}, cooldown = 28, triggerChance = 38, phase = {1, 2}},
             {name = "腐蚀点杀", skills = {{63276, "victim"}, {70852, "victim"}, {62660, "victim"}}, cooldown = 30, triggerChance = 35, phase = {2, 3}},
             {name = "轰炸终曲", skills = {{71001, "victim"}, {70852, "victim"}, {69140, "victim"}}, cooldown = 26, triggerChance = 40, phase = {3}},
+            -- 2026-09 扩充（每条 3 个技能；中段为本次新增的 WLK 团本法术）
+            {name = "冥火点名", skills = {{27810, "victim"}, {70594, "victim"}, {69140, "victim"}}, cooldown = 26, triggerChance = 38, phase = {1}},
+            {name = "尸爆连环", skills = {{63276, "victim"}, {71237, "victim"}, {64157, "victim"}}, cooldown = 30, triggerChance = 36, phase = {2}},
+            {name = "墓穴终焉", skills = {{63276, "victim"}, {63038, "self"}, {62660, "victim"}}, cooldown = 28, triggerChance = 40, phase = {3}},
         },
         openingSkills = {
             {spellId = 71001, name = "死亡凋零", target = "victim"},
-            {spellId = 62660, name = "暗影冲击", target = "victim"},
-            {spellId = 69140, name = "冰焰", target = "victim"},
+            {spellId = 62660, name = "暗影撞击", target = "victim"},
+            {spellId = 69140, name = "冷焰", target = "victim"},
         },
     },
 
     -- 破法壁垒：前期压近战站位和坦线，后期叠加群体读条压制与法系惩罚。
     spellbreak_bulwark = {
         displayName = "破法壁垒",
-        summary = "骨刃分劈、恐惧尖啸和灼烧烈焰压迫近战，冰霜箭雨、哨兵震爆与黑暗奔涌持续反制法系。",
+        summary = "前期以物理重击与破甲压迫近战和坦线，后期叠加群体读条压制与法系惩罚。",
         skillPools = {
             [1] = {
-                {spellId = 69055, name = "骨刃分劈", minCD = 8, maxCD = 13, target = "victim", priority = 7, condition = "multi_melee"}, -- Marrowgar
-                {spellId = 64386, name = "恐惧尖啸", minCD = 16, maxCD = 22, target = "self", priority = 6, condition = "many_attackers"}, -- Auriaya
-                {spellId = 72905, name = "冰霜箭雨", minCD = 14, maxCD = 20, target = "self", priority = 6, condition = "grouped_targets"}, -- Lady Deathwhisper
-                {spellId = 71204, name = "无意义之触", minCD = 12, maxCD = 18, target = "victim", priority = 6, condition = "multi_melee"}, -- Lady Deathwhisper
+                {spellId = 69055, name = "军刀猛刺", minCD = 8, maxCD = 13, target = "victim", priority = 7, condition = "multi_melee"}, -- Lord Marrowgar / 冰冠堡垒(ICC)
+                {spellId = 64386, name = "惊骇尖啸", minCD = 16, maxCD = 22, target = "self", priority = 6, condition = "many_attackers"}, -- Auriaya / 奥杜尔(Ulduar)
+                {spellId = 72905, name = "寒冰箭雨", minCD = 14, maxCD = 20, target = "self", priority = 6, condition = "grouped_targets"}, -- Lady Deathwhisper / 冰冠堡垒(ICC)
+                {spellId = 71204, name = "蔑视之触", minCD = 12, maxCD = 18, target = "victim", priority = 6, condition = "multi_melee"}, -- Lady Deathwhisper / 冰冠堡垒(ICC) / 冰冠堡垒(ICC)；DBC 效果为仇恨 -22%，不是破甲
+                {spellId = 57807, name = "破甲", minCD = 10, maxCD = 15, target = "victim", priority = 7, condition = "multi_melee"}, -- Ulduar 托里姆：叠加破甲
+                {spellId = 29310, name = "法术瓦解", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "caster_target"}, -- Naxx 肮脏的希尔盖：群体施法减速
             },
             [2] = {
-                {spellId = 62661, name = "灼烧烈焰", minCD = 14, maxCD = 20, target = "victim", priority = 8, condition = "multi_target"}, -- General Vezax
-                {spellId = 64389, name = "哨兵震爆", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "caster_target"}, -- Auriaya
-                {spellId = 72905, name = "冰霜箭雨", minCD = 13, maxCD = 19, target = "self", priority = 7, condition = "grouped_targets"},
-                {spellId = 63276, name = "无面者印记", minCD = 18, maxCD = 24, target = "victim", priority = 6, condition = "healer_target"}, -- General Vezax
+                {spellId = 62661, name = "灼热烈焰", minCD = 14, maxCD = 20, target = "victim", priority = 8, condition = "multi_target"}, -- General Vezax / 奥杜尔(Ulduar)
+                {spellId = 64389, name = "警戒冲击", minCD = 16, maxCD = 22, target = "self", priority = 7, condition = "caster_target"}, -- Auriaya / 奥杜尔(Ulduar)
+                {spellId = 72905, name = "寒冰箭雨", minCD = 13, maxCD = 19, target = "self", priority = 7, condition = "grouped_targets"},
+                {spellId = 63276, name = "无面者的印记", minCD = 18, maxCD = 24, target = "victim", priority = 6, condition = "healer_target"}, -- General Vezax / 奥杜尔(Ulduar)
+                {spellId = 65940, name = "碎裂投掷", minCD = 13, maxCD = 19, target = "victim", priority = 7, condition = "caster_target"}, -- ICC 达尔纳文：抗性 -21%
+                {spellId = 64156, name = "冷漠", minCD = 14, maxCD = 20, target = "victim", priority = 7, condition = "caster_target"}, -- Ulduar 尤格-萨隆：攻速/施法/移动三重减速
             },
             [3] = {
-                {spellId = 62662, name = "黑暗奔涌", minCD = 18, maxCD = 26, target = "self", priority = 8, condition = "multi_melee"}, -- General Vezax
-                {spellId = 62661, name = "灼烧烈焰", minCD = 12, maxCD = 18, target = "victim", priority = 8, condition = "multi_target"},
-                {spellId = 64389, name = "哨兵震爆", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "caster_target"},
-                {spellId = 72905, name = "冰霜箭雨", minCD = 12, maxCD = 18, target = "self", priority = 7, condition = "grouped_targets"},
+                {spellId = 62662, name = "黑暗涌动", minCD = 18, maxCD = 26, target = "self", priority = 8, condition = "multi_melee"}, -- General Vezax / 奥杜尔(Ulduar)
+                {spellId = 62661, name = "灼热烈焰", minCD = 12, maxCD = 18, target = "victim", priority = 8, condition = "multi_target"},
+                {spellId = 64389, name = "警戒冲击", minCD = 14, maxCD = 20, target = "self", priority = 7, condition = "caster_target"},
+                {spellId = 72905, name = "寒冰箭雨", minCD = 12, maxCD = 18, target = "self", priority = 7, condition = "grouped_targets"},
+                {spellId = 64189, name = "震耳咆哮", minCD = 16, maxCD = 24, target = "self", priority = 8, condition = "caster_target"}, -- Ulduar 尤格-萨隆：群体沉默 4s
             },
         },
         comboChains = {
             {name = "碎阵压锋", skills = {{69055, "victim"}, {64386, "self"}, {62661, "victim"}}, cooldown = 26, triggerChance = 36, phase = {1, 2}},
             {name = "破法齐射", skills = {{64389, "self"}, {72905, "self"}, {63276, "victim"}}, cooldown = 30, triggerChance = 38, phase = {2, 3}},
             {name = "黑潮封咏", skills = {{62662, "self"}, {62661, "victim"}, {72905, "self"}}, cooldown = 32, triggerChance = 40, phase = {3}},
+            -- 2026-09 扩充（每条 3 个技能；中段为本次新增的 WLK 团本法术）
+            {name = "碎甲起锋", skills = {{69055, "victim"}, {57807, "victim"}, {62661, "victim"}}, cooldown = 26, triggerChance = 38, phase = {1, 2}},
+            {name = "静默围杀", skills = {{64389, "self"}, {29310, "self"}, {72905, "self"}}, cooldown = 28, triggerChance = 36, phase = {1, 2}},
+            {name = "反咒终章", skills = {{64189, "self"}, {62662, "self"}, {64156, "victim"}}, cooldown = 32, triggerChance = 42, phase = {2, 3}},
         },
         openingSkills = {
-            {spellId = 69055, name = "骨刃分劈", target = "victim"},
-            {spellId = 72905, name = "冰霜箭雨", target = "self"},
-            {spellId = 71204, name = "无意义之触", target = "victim"},
+            {spellId = 69055, name = "军刀猛刺", target = "victim"},
+            {spellId = 72905, name = "寒冰箭雨", target = "self"},
+            {spellId = 71204, name = "蔑视之触", target = "victim"},
         },
     },
 }

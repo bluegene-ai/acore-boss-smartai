@@ -81,6 +81,34 @@ as a comma-separated key list).
 - Skill presets / difficulty coefficients / interrupt spell pool (§5 content library): combat
   *content* (spell ids, cooldowns, trigger conditions), released with the version; the selectable
   parts (which preset, which tier, which presets are in the random pool) are in the database.
+- Each preset = a 3-phase skill pool + **6 combo chains** (`comboChains`; expanded from 3 to 6 per
+  preset in 2026-09, 36 total) + 3 opening skills. A combo is a fixed 3-spell sequence cast in order
+  with no further target-condition checks (`SkillAI:TryComboChain` + the cast loop). Hard invariant:
+  **every spell a combo uses must exist in that preset's own skill pool** (enforced by the smoke test);
+  combo names are globally unique.
+- Spell provenance and validation: all spell ids come from WotLK raid content. This expansion added
+  **29 new spells** across the six presets (unique spell ids 37 -> 66, pool entries 72 -> 101), each
+  one's `name` copied byte-for-byte from the enCN name slot of the client `Spell.dbc`.
+  `tools/spell-check/spell-check.lua` checks existence plus that name comparison; provenance comes from
+  the `SPELL_* = <id>` enums and real `CastSpell/DoCast` call sites in AzerothCore's per-raid boss
+  scripts (strongest evidence), backed by `spell_script_names` (anything scripted is flagged
+  "needs care").
+  Two traps worth knowing: **`creature_template_spell` does not contain WotLK raid abilities** (they are
+  core-hardcoded), so it proves nothing; **`spelldifficulty_dbc` is largely useless for WotLK raids**
+  (the 10/25-man variants are `_10N/_25N/_10H/_25H` constants in C++), and
+  `SpellMgr::GetSpellIdForDifficulty` **returns the original spellId outside dungeons/battlegrounds** -
+  so for open-world AI the base id is the final effect, and pools only ever use base ids.
+  **22 legacy spell names were corrected to the DBC names** (e.g. `69055` "骨刃分劈" -> "军刀猛刺",
+  `72034` "白茫" -> "霜至"). The rename ships with `sql/2026_09_26_skill_yells_rename.sql` and **the two
+  must be applied together**: `skillCastYells` and the ext-table column `taunt_skill_cast_yells_text`
+  are keyed by spell name, so renaming only the script silently kills those 22 cast yells on a live realm
+  (and the rename needs `.reload ale`, not `.boss config reload`). The script anchors on line starts and is
+  safe to re-run. Three pool spells come from **5-man dungeons** (King Dred / Drak'Tharon Keep,
+  Slad'ran / Gundrak, Krick & Ick / Pit of Saron) and are now annotated as such; replacing them with raid
+  equivalents is a content decision, not a bug fix.
+  Combo yells for the expansion ship as `sql/2026_09_26_combo_yells_expansion.sql`: yells live in the
+  ext-table column `taunt_combo_yells_text`, and **the database value replaces the script defaults
+  wholesale**, so editing the script defaults alone has no effect on a live realm.
 - Display strings (class names), minion scatter distances and a few condition constants:
   logic constants rather than tunables.
 
@@ -221,7 +249,7 @@ The activity boss uses dedicated level-83 templates with no `AIName`, no `smart_
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 160+ invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, the six reward pools (including a full `OnBossDied` payout run), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 215 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, **skill pool / combo content** (every combo spell must live in its preset's pools, combo names globally unique, at least 6 combos per preset, 4 difficulties x 6 presets scale without hitting the `ClampNumber(10,80)` clamp, default-library yell coverage for every combo), **combo casting (offline driven)** (fake boss + fake player drive the real `TryComboChain` and cast loop: cast sequence equals a declared combo, per-combo and global cooldowns are written, the yell equals the configured text), the six reward pools (including a full `OnBossDied` payout run), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass

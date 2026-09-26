@@ -18,6 +18,10 @@
 
 local bossPath = arg and arg[1] or "lua_scripts/boss.lua"
 
+-- 技能池 / 连招内容回归的阈值：每个预设至少要有的连招条数。
+-- 内容扩充（18 → 36 条、每套 6 条）时**只改这一处**，断言里不写死数字。
+local MIN_COMBOS_PER_PRESET = 6
+
 -- ---------------------------------------------------------------- 记录与断言
 local recorded = { sql = {}, events = {}, replies = {}, failures = {}, alters = {}, spawnAttempts = 0 }
 local scheduledEvents = {}
@@ -301,6 +305,191 @@ assertTrue(rawget(env, "RegisterBossEventsForEntry") == nil and rawget(env, "Reg
     "RegisterBossEventsFor* 不再泄漏为全局变量")
 assertTrue(rawget(env, "activeBossInfo") == nil and rawget(env, "IsManagedBossEntry") == nil,
     "activeBossInfo / IsManagedBossEntry 仍为文件内 local")
+
+-- ------------------------------------------- 文件内 local 的取样通道（技能池 / 连招回归用）
+-- SKILL_PRESET_LIBRARY / SKILL_DIFFICULTY_LIBRARY / ApplySkillPreset / ApplySkillDifficulty /
+-- BOSS_CONFIG / bossAIStates / 缩放后的 COMBO_CHAINS 与 SKILL_POOLS 全都是文件内 local，
+-- **没有任何 .boss 命令会把它们打印出来**；唯一通道是 debug.getupvalue 走已注册回调的闭包链。
+-- 必须按变量名查：boss.lua 一改，写死的上值下标就漂了。
+local UPVALUE_WALK_LIMIT = 20000
+local UPVALUE_MAX_DEPTH = 12
+
+local function findUpvalueInCallbacks(callbacks, name)
+    local seenFunctions, seenTables = {}, {}
+    local budget = UPVALUE_WALK_LIMIT
+
+    local function walk(value, depth)
+        if budget <= 0 or depth > UPVALUE_MAX_DEPTH then return nil end
+        budget = budget - 1
+
+        local valueType = type(value)
+        if valueType == "function" then
+            if seenFunctions[value] then return nil end
+            seenFunctions[value] = true
+
+            local index = 1
+            while true do
+                local upName, upValue = debug.getupvalue(value, index)
+                if upName == nil then break end
+                if upName == name then return upValue end
+                -- _ENV 会把整个桩环境（含 recorded.sql 上千条语句）拖进来，而且文件内 local
+                -- 不可能只挂在 _ENV 上，所以整条 _ENV 分支直接跳过。
+                if upName ~= "_ENV" then
+                    local found = walk(upValue, depth + 1)
+                    if found ~= nil then return found end
+                end
+                index = index + 1
+            end
+            return nil
+        end
+
+        if valueType ~= "table" or seenTables[value] then return nil end
+        seenTables[value] = true
+
+        -- 技能方法挂在 SkillAI / TargetSelector / TauntSystem 这类表里，表必须一起走
+        for key, innerValue in pairs(value) do
+            if key ~= "_ENV" and key ~= "_G" and innerValue ~= nil and innerValue ~= _G then
+                local found = walk(innerValue, depth + 1)
+                if found ~= nil then return found end
+            end
+        end
+        return nil
+    end
+
+    -- 先查两个最有代表性的回调：命令处理器能直达 ApplySkillPreset / ApplySkillConfig 的上值链
+    local preferred = { callbacks.player["42"], callbacks.creature["190090/1"] }
+    for _, root in ipairs(preferred) do
+        local found = walk(root, 0)
+        if found ~= nil then return found end
+    end
+    -- 兜底：其余已注册回调（内容扩充后命令处理器被改名也还能取到）
+    for _, bucket in ipairs({ callbacks.creature, callbacks.player }) do
+        local keys = {}
+        for key in pairs(bucket) do keys[#keys + 1] = key end
+        table.sort(keys)
+        for _, key in ipairs(keys) do
+            local found = walk(bucket[key], 0)
+            if found ~= nil then return found end
+        end
+    end
+    return nil
+end
+
+-- 按名字取文件内 local；返回 nil 表示这个名字已经不在闭包链里（改名 / 被删除）
+local function bossLocal(name, callbacks)
+    return findUpvalueInCallbacks(callbacks or engineCallbacks, name)
+end
+
+-- 沿上值链（含表内的函数）递归找「含指定字段的表」：按名字查不到时的兜底通道
+local function reachableTable(root, field, maxDepth, validator)
+    local seenFunctions, seenTables = {}, {}
+    local depthLimit = maxDepth or UPVALUE_MAX_DEPTH
+
+    local function walk(value, depth)
+        local valueType = type(value)
+        if valueType == "function" then
+            if seenFunctions[value] or depth > depthLimit then return nil end
+            seenFunctions[value] = true
+
+            local index = 1
+            while true do
+                local upName, upValue = debug.getupvalue(value, index)
+                if upName == nil then break end
+                if upName ~= "_ENV" then
+                    local found = walk(upValue, depth + 1)
+                    if found ~= nil then return found end
+                end
+                index = index + 1
+            end
+            return nil
+        end
+
+        if valueType ~= "table" or seenTables[value] then return nil end
+        seenTables[value] = true
+
+        if rawget(value, field) ~= nil and (validator == nil or validator(value)) then
+            return value
+        end
+        if depth > depthLimit then return nil end
+
+        for key, innerValue in pairs(value) do
+            if key ~= "_ENV" and key ~= "_G" and innerValue ~= nil and innerValue ~= _G then
+                local found = walk(innerValue, depth + 1)
+                if found ~= nil then return found end
+            end
+        end
+        return nil
+    end
+
+    return walk(root, 0)
+end
+
+-- 缩放后的技能池 / 连招必须**每次现取**：ApplySkillConfig 会整体重绑这两个 local
+-- （boss.lua:1873-1875），缓存下来就会断言到上一套预设。
+local function scaledComboChains()
+    local chains = bossLocal("COMBO_CHAINS")
+    if chains ~= nil then return chains end
+    return reachableTable(engineCallbacks.player["42"], 1, UPVALUE_MAX_DEPTH, function(candidate)
+        local first = rawget(candidate, 1)
+        return type(first) == "table" and type(rawget(first, "skills")) == "table"
+    end)
+end
+
+local function scaledSkillPools()
+    local pools = bossLocal("SKILL_POOLS")
+    if pools ~= nil then return pools end
+    return reachableTable(engineCallbacks.player["42"], 1, UPVALUE_MAX_DEPTH, function(candidate)
+        local firstPool = rawget(candidate, 1)
+        local firstSkill = type(firstPool) == "table" and rawget(firstPool, 1) or nil
+        return type(firstSkill) == "table" and rawget(firstSkill, "spellId") ~= nil
+    end)
+end
+
+local function assertEq(got, want, msg)
+    assertTrue(got == want,
+        msg .. "（实际 " .. tostring(got) .. "，期望 " .. tostring(want) .. "）")
+end
+
+-- 加载一份「CharDBQuery 全部返回 nil」的副本，用来读**文件内默认值**：
+-- 运行时的 comboYells 会被扩展表列 taunt_combo_yells_text **整体替换**
+-- （boss.lua:674-675 声明为 keyedlines、839-841 的 setter 是整体赋值），
+-- 而冒烟快照里只给了 1 条假 key，所以默认库只有另加载一份副本才拿得到。
+-- 段内临时换掉 engineCallbacks 的两张表，退出时**整表还原**
+-- （多区绑定段的子环境会覆盖它们，只能整表放回，不能只删自己加的 key）。
+local function withDefaultConfig(fn)
+    local childEnv = setmetatable({
+        -- DB 读一律返回 nil（走文件内默认分支），写一律丢弃（不污染 recorded.sql）
+        CharDBQuery = function() return nil end,
+        CharDBExecute = function() end,
+        WorldDBQuery = function() return nil end,
+        WorldDBExecute = function() end,
+        CreateLuaEvent = function() return 0 end,
+        RemoveEventById = function() end,
+        print = function() end,
+    }, { __index = env })
+
+    local savedCreature, savedPlayer = engineCallbacks.creature, engineCallbacks.player
+    engineCallbacks.creature, engineCallbacks.player = {}, {}
+
+    local callResult = nil
+    local chunk, loadErr = loadfile(bossPath, "t", childEnv)
+    if not chunk then
+        fail("默认配置副本加载失败: " .. tostring(loadErr))
+    else
+        local runOk, runErr = pcall(chunk)
+        if not runOk then
+            fail("默认配置副本运行期错误: " .. tostring(runErr))
+        else
+            local callOk, callErr = pcall(function() callResult = fn(engineCallbacks) end)
+            if not callOk then
+                fail("默认配置副本断言出错: " .. tostring(callErr))
+            end
+        end
+    end
+
+    engineCallbacks.creature, engineCallbacks.player = savedCreature, savedPlayer
+    return callResult
+end
 
 -- ------------------------------------------------------ 配置读写 SQL 是否成形
 local mainConfigWrites, extConfigWrites = 0, 0
@@ -814,6 +1003,369 @@ assertTrue(badPoolMarkers:find("AGMP_ERROR", 1, true) ~= nil, ".boss preset pool
 runConsoleCommand("boss preset random on")
 runConsoleCommand("boss preset pool ember_storm,frost_whiteout")
 
+-- ------------------------------------------------- 技能池 / 连招内容（静态不变量 + 真实加载缩放）
+-- 「技能池随机」段只保证抽出来的预设合法；这里回归的是**池与连招的内容本身**：
+--   1) 连招里声明的每个法术都必须出现在同一预设的 skillPools 里（否则实发时会打出"池外法术"）；
+--   2) 连招 phase 非空且 ⊆{1,2,3}，且至少有一个法术落在它声明阶段的池里；
+--   3) 条目自检（spellId>0 / target∈{victim,self} / name 非空）；池恰好覆盖 1/2/3 且每池非空；
+--   4) 连招名跨预设全局唯一；每个预设至少 MIN_COMBOS_PER_PRESET 条；每条连招都有连招喊话；
+--   5) 真的走 ApplySkillPreset / ApplySkillDifficulty（4 档 × 全部预设）后**现取**缩放结果，
+--      确认冷却/概率落在设计区间，且难度偏移没有被 ClampNumber(...,10,80) 静默钳掉。
+-- 这些内容全是文件内 local，只能按名字从闭包链上取（见上方"文件内 local 的取样通道"）。
+io.write("\n== 技能池 / 连招内容（静态不变量 + 真实加载缩放） ==\n")
+
+local skillPresetLibrary = bossLocal("SKILL_PRESET_LIBRARY")
+local skillDifficultyLibrary = bossLocal("SKILL_DIFFICULTY_LIBRARY")
+local applySkillPreset = bossLocal("ApplySkillPreset")
+local applySkillDifficulty = bossLocal("ApplySkillDifficulty")
+local bossConfigTree = bossLocal("BOSS_CONFIG")
+
+assertTrue(type(skillPresetLibrary) == "table" and next(skillPresetLibrary) ~= nil,
+    "按名字取到文件内 local SKILL_PRESET_LIBRARY（debug.getupvalue 走已注册回调的闭包链）")
+assertTrue(type(skillDifficultyLibrary) == "table" and next(skillDifficultyLibrary) ~= nil,
+    "按名字取到 SKILL_DIFFICULTY_LIBRARY")
+assertTrue(type(applySkillPreset) == "function" and type(applySkillDifficulty) == "function",
+    "按名字取到 ApplySkillPreset / ApplySkillDifficulty（缩放断言走真实函数）")
+assertTrue(type(bossConfigTree) == "table" and type(bossConfigTree.combatTaunts) == "table",
+    "按名字取到 BOSS_CONFIG（连招喊话断言用运行时配置树）")
+
+local function faultText(list)
+    if #list == 0 then return "" end
+    return "（" .. table.concat(list, "；", 1, math.min(#list, 6)) .. (#list > 6 and " …" or "") .. "）"
+end
+
+-- 预设 key 排序后逐个检查：不写死 6 套，内容扩充后自动覆盖新预设
+local presetKeys = {}
+if type(skillPresetLibrary) == "table" then
+    for presetKey in pairs(skillPresetLibrary) do presetKeys[#presetKeys + 1] = presetKey end
+end
+table.sort(presetKeys, function(left, right) return tostring(left) < tostring(right) end)
+assertTrue(#presetKeys > 0, "技能池预设表非空（当前 " .. #presetKeys .. " 套）")
+
+local comboNameOwner = {}
+local poolFaults, entryFaults, poolSpellFaults, phaseFaults = {}, {}, {}, {}
+local phaseCoverFaults, openingFaults, comboNameFaults, thinPresets = {}, {}, {}, {}
+local comboTotal = 0
+
+for _, presetKey in ipairs(presetKeys) do
+    local preset = skillPresetLibrary[presetKey]
+    local pools = type(preset) == "table" and preset.skillPools or nil
+    local combos = type(preset) == "table" and preset.comboChains or nil
+    local openings = type(preset) == "table" and preset.openingSkills or nil
+
+    -- 池：恰好覆盖 1/2/3 三个阶段，且每池非空
+    local poolPhases = {}
+    if type(pools) == "table" then
+        for phase in pairs(pools) do poolPhases[#poolPhases + 1] = tostring(phase) end
+    end
+    table.sort(poolPhases)
+    local poolShapeOk = type(pools) == "table" and #poolPhases == 3
+        and poolPhases[1] == "1" and poolPhases[2] == "2" and poolPhases[3] == "3"
+    if not poolShapeOk then
+        poolFaults[#poolFaults + 1] = string.format("%s(阶段=%s)", tostring(presetKey), table.concat(poolPhases, "/"))
+    end
+
+    local poolSpellIds, spellPoolPhases, poolSpellCount, openingCount = {}, {}, 0, 0
+    for phase = 1, 3 do
+        local phasePool = type(pools) == "table" and pools[phase] or nil
+        if type(phasePool) == "table" then
+            if #phasePool == 0 then
+                poolFaults[#poolFaults + 1] = string.format("%s(阶段%d空)", tostring(presetKey), phase)
+            end
+            for _, skill in ipairs(phasePool) do
+                poolSpellCount = poolSpellCount + 1
+                if type(skill) ~= "table" then
+                    entryFaults[#entryFaults + 1] = tostring(presetKey) .. "/池" .. phase .. " 非表条目"
+                else
+                    local spellId = tonumber(skill.spellId) or 0
+                    if spellId <= 0 then
+                        entryFaults[#entryFaults + 1] = string.format("%s/池%d spellId=%s", tostring(presetKey), phase, tostring(skill.spellId))
+                    end
+                    if skill.target ~= "victim" and skill.target ~= "self" then
+                        entryFaults[#entryFaults + 1] = string.format("%s/池%d(spellId %d) target=%s", tostring(presetKey), phase, spellId, tostring(skill.target))
+                    end
+                    if type(skill.name) ~= "string" or skill.name == "" then
+                        entryFaults[#entryFaults + 1] = string.format("%s/池%d(spellId %d) 缺 name", tostring(presetKey), phase, spellId)
+                    end
+                    if spellId > 0 then
+                        poolSpellIds[spellId] = true
+                        spellPoolPhases[spellId] = spellPoolPhases[spellId] or {}
+                        spellPoolPhases[spellId][phase] = true
+                    end
+                end
+            end
+        elseif poolShapeOk then
+            poolFaults[#poolFaults + 1] = string.format("%s(阶段%d非表)", tostring(presetKey), phase)
+        end
+    end
+
+    -- 连招：每个法术都要在同预设的池里；阶段声明 / 阶段覆盖 / 命名 / 条数
+    local presetComboCount, coveredPhases = 0, {}
+    for _, combo in ipairs(combos or {}) do
+        presetComboCount = presetComboCount + 1
+        local comboLabel = string.format("%s/%s", tostring(presetKey),
+            tostring(type(combo) == "table" and combo.name or "?"))
+        if type(combo) ~= "table" then
+            phaseFaults[#phaseFaults + 1] = comboLabel .. " 非表条目"
+        else
+            if type(combo.name) ~= "string" or combo.name == "" then
+                comboNameFaults[#comboNameFaults + 1] = tostring(presetKey) .. " 第 " .. presetComboCount .. " 条缺 name"
+            else
+                local owner = comboNameOwner[combo.name]
+                if owner ~= nil then
+                    comboNameFaults[#comboNameFaults + 1] = string.format("%s（%s 与 %s 重复）", combo.name, owner, tostring(presetKey))
+                else
+                    comboNameOwner[combo.name] = presetKey
+                end
+            end
+
+            local declaredPhases, phaseOk = {}, false
+            if type(combo.phase) == "table" and #combo.phase > 0 then
+                phaseOk = true
+                for _, phase in ipairs(combo.phase) do
+                    local numericPhase = tonumber(phase)
+                    if numericPhase == 1 or numericPhase == 2 or numericPhase == 3 then
+                        declaredPhases[numericPhase] = true
+                    else
+                        phaseOk = false
+                    end
+                end
+            end
+            if not phaseOk then
+                phaseFaults[#phaseFaults + 1] = comboLabel .. " phase 非空且 ⊆{1,2,3} 不成立"
+            end
+
+            local skills = combo.skills
+            if type(skills) ~= "table" or #skills == 0 then
+                poolSpellFaults[#poolSpellFaults + 1] = comboLabel .. " 没有 skills"
+            else
+                local spellInDeclaredPhase = false
+                for skillIndex, skillInfo in ipairs(skills) do
+                    local spellId = type(skillInfo) == "table" and tonumber(skillInfo[1]) or nil
+                    local targetType = type(skillInfo) == "table" and skillInfo[2] or nil
+                    if spellId == nil or not poolSpellIds[spellId] then
+                        poolSpellFaults[#poolSpellFaults + 1] = string.format("%s 第%d个法术 %s 不在 %s 的池里",
+                            comboLabel, skillIndex, tostring(spellId), tostring(presetKey))
+                    else
+                        for phase in pairs(declaredPhases) do
+                            if (spellPoolPhases[spellId] or {})[phase] then spellInDeclaredPhase = true end
+                        end
+                    end
+                    if targetType ~= "victim" and targetType ~= "self" then
+                        phaseFaults[#phaseFaults + 1] = string.format("%s 第%d个法术 target=%s",
+                            comboLabel, skillIndex, tostring(targetType))
+                    end
+                end
+                if phaseOk and not spellInDeclaredPhase then
+                    phaseFaults[#phaseFaults + 1] = comboLabel .. " 没有法术出现在它声明阶段的池里"
+                end
+            end
+
+            for phase in pairs(declaredPhases) do coveredPhases[phase] = true end
+        end
+    end
+
+    if presetComboCount < MIN_COMBOS_PER_PRESET then
+        thinPresets[#thinPresets + 1] = string.format("%s(%d)", tostring(presetKey), presetComboCount)
+    end
+    for phase = 1, 3 do
+        if not coveredPhases[phase] then
+            phaseCoverFaults[#phaseCoverFaults + 1] = string.format("%s(阶段%d)", tostring(presetKey), phase)
+        end
+    end
+
+    -- 开场技能：spellId>0 / target 合法 / 法术在池里
+    if type(openings) ~= "table" or #openings == 0 then
+        openingFaults[#openingFaults + 1] = tostring(presetKey) .. " 没有 openingSkills"
+    else
+        for _, opening in ipairs(openings) do
+            openingCount = openingCount + 1
+            local openingSpellId = type(opening) == "table" and tonumber(opening.spellId) or nil
+            if openingSpellId == nil or openingSpellId <= 0 or not poolSpellIds[openingSpellId] then
+                openingFaults[#openingFaults + 1] = string.format("%s 开场法术 %s 不在池里",
+                    tostring(presetKey), tostring(openingSpellId))
+            end
+            if type(opening) ~= "table" or (opening.target ~= "victim" and opening.target ~= "self") then
+                openingFaults[#openingFaults + 1] = string.format("%s 开场 target=%s", tostring(presetKey),
+                    tostring(type(opening) == "table" and opening.target or nil))
+            end
+        end
+    end
+
+    comboTotal = comboTotal + presetComboCount
+    io.write(string.format("  [info] 预设 %-19s 池法术 %2d / 连招 %d 条 / 开场技能 %d 个\n",
+        tostring(presetKey), poolSpellCount, presetComboCount, openingCount))
+end
+
+assertTrue(#poolFaults == 0, "每个预设的 1/2/3 技能池都存在、结构齐全且非空" .. faultText(poolFaults))
+assertTrue(#entryFaults == 0, "池条目标自检（spellId>0 / target∈{victim,self} / name 非空）" .. faultText(entryFaults))
+assertTrue(#poolSpellFaults == 0,
+    string.format("连招里的每个法术 ID 都在同一预设的池内（%d 条连招，核心不变量）", comboTotal) .. faultText(poolSpellFaults))
+assertTrue(#phaseFaults == 0, "连招 phase 非空且 ⊆{1,2,3}，且至少有一个法术落在它声明阶段的池里" .. faultText(phaseFaults))
+assertTrue(#phaseCoverFaults == 0, "每个预设的 1/2/3 阶段都被至少一条连招覆盖" .. faultText(phaseCoverFaults))
+assertTrue(#openingFaults == 0, "开场技能 spellId / target 合法且都取自同预设的池" .. faultText(openingFaults))
+assertTrue(#comboNameFaults == 0, "连招名全局唯一（跨预设也不重复）" .. faultText(comboNameFaults))
+assertTrue(#thinPresets == 0,
+    string.format("每个预设至少 %d 条连招（顶部常量 MIN_COMBOS_PER_PRESET，内容扩充后改这一处）", MIN_COMBOS_PER_PRESET)
+    .. faultText(thinPresets))
+
+-- 连招喊话：**文件内默认库**必须覆盖每一条连招名（硬断言）。
+-- 运行时那一份会被扩展表列 taunt_combo_yells_text 整体替换，而快照里只给了 1 条假 key
+-- （smoke.lua 的 EXT_VALUES），硬断言会一片假失败，所以运行时那份只输出 [info]。
+local defaultComboYells = withDefaultConfig(function(childCallbacks)
+    local childConfig = bossLocal("BOSS_CONFIG", childCallbacks)
+    if type(childConfig) == "table" and type(childConfig.combatTaunts) == "table" then
+        return childConfig.combatTaunts.comboYells
+    end
+    return nil
+end)
+
+assertTrue(type(defaultComboYells) == "table", "默认配置副本里取到文件内默认的 comboYells")
+local defaultYellCount, missingDefaultYells = 0, {}
+if type(defaultComboYells) == "table" then
+    for _ in pairs(defaultComboYells) do defaultYellCount = defaultYellCount + 1 end
+    for name in pairs(comboNameOwner) do
+        local yell = defaultComboYells[name]
+        if type(yell) ~= "string" or yell == "" then
+            missingDefaultYells[#missingDefaultYells + 1] = tostring(name)
+        end
+    end
+end
+assertTrue(#missingDefaultYells == 0,
+    string.format("文件内默认库的连招喊话覆盖全部 %d 条连招名（默认库共 %d 条喊话）", comboTotal, defaultYellCount)
+    .. faultText(missingDefaultYells))
+
+local runtimeComboYells = type(bossConfigTree) == "table" and type(bossConfigTree.combatTaunts) == "table"
+    and bossConfigTree.combatTaunts.comboYells or nil
+local runtimeYellCovered = 0
+if type(runtimeComboYells) == "table" then
+    for name in pairs(comboNameOwner) do
+        if type(runtimeComboYells[name]) == "string" and runtimeComboYells[name] ~= "" then
+            runtimeYellCovered = runtimeYellCovered + 1
+        end
+    end
+end
+io.write(string.format("  [info] 运行时 comboYells 覆盖 %d/%d 条连招（DB 快照只有 1 条假 key，属预期；硬断言走默认库）\n",
+    runtimeYellCovered, comboTotal))
+
+-- 真实加载缩放：4 档难度 × 全部预设，走 ApplySkillPreset / ApplySkillDifficulty 后现取缩放结果
+if type(applySkillPreset) == "function" and type(applySkillDifficulty) == "function" and #presetKeys > 0 then
+    local restorePresetKey = bossLocal("ACTIVE_SKILL_PRESET_KEY")
+    local restoreDifficultyKey = bossLocal("ACTIVE_SKILL_DIFFICULTY_KEY")
+    assertTrue(restorePresetKey ~= nil and restoreDifficultyKey ~= nil,
+        "取到当前生效的预设 key / 难度 key（缩放断言结束后要复原现场）")
+
+    local difficultyKeys = {}
+    if type(skillDifficultyLibrary) == "table" then
+        for key in pairs(skillDifficultyLibrary) do difficultyKeys[#difficultyKeys + 1] = key end
+    end
+    table.sort(difficultyKeys, function(left, right) return tostring(left) < tostring(right) end)
+
+    local scaleFaults, chanceFaults, clampFaults, formulaFaults, poolCdFaults = {}, {}, {}, {}, {}
+    local pairCount, chainCount, clampCount = 0, 0, 0
+    local ranges = {}
+
+    for _, difficultyKey in ipairs(difficultyKeys) do
+        for _, presetKey in ipairs(presetKeys) do
+            pairCount = pairCount + 1
+            applySkillPreset(presetKey)
+            applySkillDifficulty(difficultyKey)
+
+            local difficulty = skillDifficultyLibrary[difficultyKey]
+            local offset = tonumber(difficulty and difficulty.comboChanceOffset) or 0
+            local rawCombos = type(skillPresetLibrary[presetKey]) == "table"
+                and skillPresetLibrary[presetKey].comboChains or nil
+            local scaledChains = scaledComboChains()
+            local scaledPools = scaledSkillPools()
+            local range = ranges[difficultyKey]
+                or { minCD = nil, maxCD = nil, minChance = nil, maxChance = nil, clamped = 0 }
+            ranges[difficultyKey] = range
+
+            for index, combo in ipairs(scaledChains or {}) do
+                chainCount = chainCount + 1
+                local label = string.format("%s/%s/%s", tostring(difficultyKey), tostring(presetKey), tostring(combo.name))
+
+                local cooldown = tonumber(combo.cooldown) or 0
+                if cooldown < 4 then
+                    scaleFaults[#scaleFaults + 1] = string.format("%s cooldown=%s <4（ScaleCooldown 下限）",
+                        label, tostring(combo.cooldown))
+                end
+                if cooldown < 10 or cooldown > 45 then
+                    scaleFaults[#scaleFaults + 1] = string.format("%s cooldown=%s ∉10..45", label, tostring(combo.cooldown))
+                end
+                if range.minCD == nil or cooldown < range.minCD then range.minCD = cooldown end
+                if range.maxCD == nil or cooldown > range.maxCD then range.maxCD = cooldown end
+
+                local chance = tonumber(combo.triggerChance)
+                if chance == nil or chance < 10 or chance > 80 then
+                    chanceFaults[#chanceFaults + 1] = string.format("%s triggerChance=%s ∉10..80",
+                        label, tostring(combo.triggerChance))
+                end
+                if chance ~= nil then
+                    if range.minChance == nil or chance < range.minChance then range.minChance = chance end
+                    if range.maxChance == nil or chance > range.maxChance then range.maxChance = chance end
+                end
+
+                local rawCombo = type(rawCombos) == "table" and rawCombos[index] or nil
+                local rawChance = type(rawCombo) == "table" and (tonumber(rawCombo.triggerChance) or 30) or 30
+                local rawShifted = rawChance + offset
+                if rawShifted < 10 or rawShifted > 80 then
+                    clampCount = clampCount + 1
+                    range.clamped = range.clamped + 1
+                    clampFaults[#clampFaults + 1] = string.format(
+                        "%s raw %d + comboChanceOffset %d = %d ∉10..80（会被 ClampNumber 静默钳制）",
+                        label, rawChance, offset, rawShifted)
+                elseif chance ~= rawShifted then
+                    formulaFaults[#formulaFaults + 1] = string.format("%s 缩放后 %s ≠ raw %d + offset %d",
+                        label, tostring(combo.triggerChance), rawChance, offset)
+                end
+            end
+
+            for phase = 1, 3 do
+                local phasePool = type(scaledPools) == "table" and scaledPools[phase] or nil
+                for _, skill in ipairs(phasePool or {}) do
+                    local minCD, maxCD = tonumber(skill.minCD), tonumber(skill.maxCD)
+                    if minCD == nil or minCD < 4 or maxCD == nil or maxCD < minCD then
+                        poolCdFaults[#poolCdFaults + 1] = string.format("%s/%s/阶段%d spellId %s CD %s..%s",
+                            tostring(difficultyKey), tostring(presetKey), phase, tostring(skill.spellId),
+                            tostring(skill.minCD), tostring(skill.maxCD))
+                    end
+                end
+            end
+        end
+    end
+
+    assertTrue(pairCount == #difficultyKeys * #presetKeys,
+        string.format("缩放断言覆盖 %d 档难度 × %d 套预设 = %d 组（%d 条连招）",
+            #difficultyKeys, #presetKeys, pairCount, chainCount))
+    assertTrue(#scaleFaults == 0, "缩放后连招冷却 ≥4 且落在 10..45" .. faultText(scaleFaults))
+    assertTrue(#chanceFaults == 0, "缩放后连招触发概率落在 10..80" .. faultText(chanceFaults))
+    assertTrue(#clampFaults == 0,
+        string.format("raw triggerChance + comboChanceOffset 本身就在 10..80 内（没被 ClampNumber 钳制：钳制 %d 条）", clampCount)
+        .. faultText(clampFaults))
+    assertTrue(#formulaFaults == 0, "难度偏移真的生效（缩放后 triggerChance == raw + offset）" .. faultText(formulaFaults))
+    assertTrue(#poolCdFaults == 0, "缩放后技能池冷却 ≥4 且 minCD ≤ maxCD" .. faultText(poolCdFaults))
+
+    for _, difficultyKey in ipairs(difficultyKeys) do
+        local range = ranges[difficultyKey]
+        if range and range.minCD ~= nil then
+            io.write(string.format("  [info] %-9s 缩放区间: 冷却 %s..%s / 概率 %s..%s（钳制 %d 条）\n",
+                tostring(difficultyKey), tostring(range.minCD), tostring(range.maxCD),
+                tostring(range.minChance), tostring(range.maxChance), range.clamped))
+        end
+    end
+
+    -- 复原现场：后面的奖池实发段 / 连招施放段仍在同一个父副本里跑，不能被缩放断言改掉预设
+    if restorePresetKey ~= nil and restoreDifficultyKey ~= nil then
+        applySkillPreset(restorePresetKey)
+        applySkillDifficulty(restoreDifficultyKey)
+    end
+    assertEq(bossLocal("ACTIVE_SKILL_PRESET_KEY"), restorePresetKey, "缩放断言结束后预设复原")
+    assertEq(bossLocal("ACTIVE_SKILL_DIFFICULTY_KEY"), restoreDifficultyKey, "缩放断言结束后难度复原")
+    local restoredChains = scaledComboChains()
+    assertTrue(type(restoredChains) == "table" and #restoredChains > 0, "复原后缩放连招表仍非空")
+end
+
 -- ------------------------------------------------- 6 个独立奖池（旧奖励模型已删除）
 -- 三件事必须成立：
 --   1) 每池 6 列都进了扩展表建表/引导写入，老库缺列时自动补；
@@ -1150,6 +1702,260 @@ assertTrue(#recorded.replies > 0 and table.concat(recorded.replies, " "):find("�
 env.type = originalType
 env.PerformIngameSpawn = originalPerformIngameSpawn
 env.GetPlayerByGUID = originalGetPlayerByGUID
+
+-- ------------------------------------------------- 连招施放（离线驱动：假 Boss + 假玩家）
+-- 奖池实发段只证明「死亡结算」这条链路；这里补的是**连招真的会被执行**：
+--   假 Boss（IsInCombat=true / 90% 血 = 阶段 1）+ 假玩家（战士，没在读条 / 满血）
+--   走一遍 OnBossEnterCombat → SmartBossAI 两次（第 1 次只放开场技能并置 openingDone，
+--   第 2 次走连招），断言施放序列与某条声明的连招完全一致、连招冷却写对、连招喊话念对。
+-- 这一段的状态是干净的：上一段的 OnBossDied（boss.lua:5490-5503）已经清了
+-- scriptSpawnedBossGUIDs / bossAIStates 并 ClearActiveBoss()，所以可以再来一次
+-- `boss spawn force`（否则 HasActiveBoss() 会挡住生成）。
+-- 随机性通过 env.math 固定成「概率判定必过 + 取第一项」，不污染真实 math。
+io.write("\n== 连招施放（离线驱动） ==\n")
+
+-- 本段专用的假对象：不复用奖池实发段的 fakeBoss / newFakePlayer，避免互相串味
+local comboGuid = 777002
+
+local comboWarrior = { __fake = true }
+comboWarrior.IsInWorld = function() return true end
+comboWarrior.IsPlayer = function() return true end
+comboWarrior.GetName = function() return "连招测试战士" end
+comboWarrior.GetGUIDLow = function() return 502 end
+comboWarrior.GetGUID = function() return "502" end
+comboWarrior.GetClass = function() return 1 end
+comboWarrior.GetAccountId = function() return 9502 end
+comboWarrior.GetMapId = function() return 571 end
+comboWarrior.GetX = function() return 4108.16 end
+comboWarrior.GetY = function() return 5316.85 end
+comboWarrior.GetZ = function() return 28.76 end
+comboWarrior.GetHealthPct = function() return 100 end     -- 满血：不触发低血嘲讽
+comboWarrior.IsCasting = function() return false end      -- 没在读条：不触发打断优先
+comboWarrior.GetDistance = function() return 5 end
+comboWarrior.SendBroadcastMessage = function() end
+comboWarrior.CanUseItem = function() return false end
+
+-- 假 Boss：IsInCombat 必须为 true，否则 SmartBossAI 在 boss.lua:4305 直接 return
+local comboBoss = { __fake = true, casts = {}, yells = {}, events = {} }
+comboBoss.IsInWorld = function() return true end
+comboBoss.IsAlive = function() return true end
+comboBoss.IsInCombat = function() return true end
+comboBoss.GetGUIDLow = function() return comboGuid end
+comboBoss.GetEntry = function() return 190090 end
+comboBoss.GetName = function() return "送财童子" end
+comboBoss.GetMapId = function() return 571 end
+comboBoss.GetInstanceId = function() return 0 end
+comboBoss.GetX = function() return 4108.16 end
+comboBoss.GetY = function() return 5316.85 end
+comboBoss.GetZ = function() return 28.76 end
+comboBoss.GetO = function() return 0 end
+comboBoss.GetMaxHealth = function() return 4392675 end
+comboBoss.GetHealth = function() return 4392675 end
+comboBoss.GetHealthPct = function() return 90 end       -- 90% 血 → 阶段 1（> phase2HpThreshold）
+comboBoss.SetMaxHealth = function() end
+comboBoss.SetHealth = function() end
+comboBoss.SetLevel = function() end
+comboBoss.SetScale = function() end
+comboBoss.SetHomePosition = function() end
+comboBoss.UpdateEntry = function() end
+comboBoss.GetFaction = function() return 14 end
+comboBoss.SetFaction = function() end
+comboBoss.AddAura = function() end
+comboBoss.RemoveAura = function() end
+comboBoss.RemoveEvents = function(self) self.events = {} end
+comboBoss.RegisterEvent = function(self, fn, delay, repeats)
+    table.insert(self.events, {fn = fn, delay = delay, repeats = repeats})
+end
+comboBoss.SendUnitYell = function(self, message) table.insert(self.yells, tostring(message)) end
+comboBoss.CastSpell = function(self, target, spellId)
+    table.insert(self.casts, {spellId = tonumber(spellId), target = (target == self) and "self" or "victim"})
+    return true
+end
+comboBoss.AttackStart = function() end
+comboBoss.MoveChase = function() end
+comboBoss.SpawnCreature = function() return nil end      -- 援军/小怪：本段只验连招施放，不需要它们真的出现
+comboBoss.GetVictim = function() return comboWarrior end
+comboBoss.GetThreatList = function() return {comboWarrior} end
+comboBoss.GetPlayersInRange = function() return {comboWarrior} end
+comboBoss.GetDistance = function() return 5 end
+
+-- 连招喊话：运行时那份被扩展表列**整体替换**，而冒烟快照里只有 1 条假 key，
+-- 直接硬断言会一片假失败。组内先把全部连招名写进快照再 boss config reload，
+-- 这样「连招喊话内容」这条断言才是在验代码路径（默认库的覆盖性已在上一组硬断言过）。
+local comboYellLibrary = bossLocal("SKILL_PRESET_LIBRARY")
+if type(comboYellLibrary) == "table" then
+    local yellLines = {}
+    for _, preset in pairs(comboYellLibrary) do
+        for _, combo in ipairs((type(preset) == "table" and preset.comboChains) or {}) do
+            if type(combo.name) == "string" and combo.name ~= "" then
+                yellLines[#yellLines + 1] = combo.name .. "=【连招喊话】" .. combo.name
+            end
+        end
+    end
+    table.sort(yellLines)
+    EXT_VALUES.taunt_combo_yells_text = table.concat(yellLines, "\n")
+    local reloadMarkers = markersOf(runConsoleCommand("boss config reload"))
+    assertTrue(reloadMarkers:find("AGMP_OK", 1, true) ~= nil,
+        "连招段：写入连招喊话后 boss config reload 返回 AGMP_OK")
+else
+    fail("连招段：取不到 SKILL_PRESET_LIBRARY，无法准备连招喊话")
+end
+
+local comboConfig = bossLocal("BOSS_CONFIG")
+local comboYellMap = type(comboConfig) == "table" and type(comboConfig.combatTaunts) == "table"
+    and comboConfig.combatTaunts.comboYells or nil
+assertTrue(type(comboYellMap) == "table" and next(comboYellMap) ~= nil,
+    "连招段：运行时 comboYells 已从扩展表列装载（组内写入，供喊话硬断言用）")
+
+local savedComboMath = env.math
+local savedComboType = env.type
+local savedComboSpawn = env.PerformIngameSpawn
+local savedComboGetPlayer = env.GetPlayerByGUID
+
+-- 确定性随机：只换 boss.lua 的 _ENV.math，不动真实 math
+env.math = setmetatable({
+    random = function(a, b)
+        if a == nil then return 0.5 end        -- 无参形态（boss.lua:5107 / 4266 的随机角度）
+        if b ~= nil then return a end          -- math.random(min,max) → 取 min
+        if a <= 0 then error("interval is empty") end
+        return 1                               -- math.random(n) → 第一项；概率判定必过
+    end,
+}, { __index = math })
+
+-- IsUnitValid 要求 type(unit)=="userdata"（boss.lua:2823-2827），照奖池实发段的 __fake 写法冒充
+env.type = function(value)
+    if type(value) == "table" and rawget(value, "__fake") then return "userdata" end
+    return savedComboType(value)
+end
+env.PerformIngameSpawn = function() return comboBoss end
+env.GetPlayerByGUID = function(guid)
+    if tostring(guid) == "502" then return comboWarrior end
+    return nil
+end
+
+local spawnMarkers = markersOf(runConsoleCommand("boss spawn force"))
+assertTrue(spawnMarkers:find("AGMP_OK", 1, true) ~= nil,
+    "连招段：boss spawn force 生成假 Boss 返回 [AGMP_OK]")
+
+local onEnterCombat = engineCallbacks.creature["190090/1"]
+assertTrue(type(onEnterCombat) == "function", "连招段：拿到 190090 的 ON_ENTER_COMBAT 回调")
+if type(onEnterCombat) == "function" then
+    local entered, enterErr = pcall(onEnterCombat, 0, comboBoss, comboWarrior)
+    assertTrue(entered, "连招段：OnBossEnterCombat 驱动成功"
+        .. (entered and "" or ("（" .. tostring(enterErr) .. "）")))
+end
+
+local comboStates = bossLocal("bossAIStates")
+local comboState = type(comboStates) == "table" and comboStates[comboGuid] or nil
+assertTrue(type(comboState) == "table", "连招段：OnBossEnterCombat 建出 bossAIStates[" .. comboGuid .. "]")
+if type(comboState) == "table" then
+    assertTrue(comboState.phase == 1 and comboState.openingDone == false,
+        string.format("连招段：AI 状态初值 phase=%s / openingDone=%s（90%% 血 = 阶段 1）",
+            tostring(comboState.phase), tostring(comboState.openingDone)))
+end
+assertTrue(#comboBoss.events >= 1 and type(comboBoss.events[1].fn) == "function",
+    "连招段：OnBossEnterCombat 注册了智能 AI 回调（creature:RegisterEvent(SmartBossAI, ...)）")
+
+local aiCallback = comboBoss.events[1] and comboBoss.events[1].fn
+if type(aiCallback) == "function" and type(comboState) == "table" then
+    -- 第 1 次 AI 循环：只放开场技能并置 openingDone
+    comboBoss.casts, comboBoss.yells = {}, {}
+    local firstOk, firstErr = pcall(aiCallback, 0, 2500, 0, comboBoss)
+    assertTrue(firstOk, "连招段：第 1 次 AI 循环执行成功"
+        .. (firstOk and "" or ("（" .. tostring(firstErr) .. "）")))
+    assertTrue(comboState.openingDone == true, "连招段：第 1 次 AI 循环置 openingDone=true")
+    assertTrue(#comboBoss.casts == 1,
+        "连招段：第 1 次 AI 循环只施放开场技能（实际施放 " .. #comboBoss.casts .. " 个法术）")
+
+    local activePresetKey = bossLocal("ACTIVE_SKILL_PRESET_KEY")
+    local expectedOpening = nil
+    if type(comboYellLibrary) == "table" and type(activePresetKey) == "string" then
+        local activePreset = comboYellLibrary[activePresetKey]
+        local firstOpening = type(activePreset) == "table" and type(activePreset.openingSkills) == "table"
+            and activePreset.openingSkills[1] or nil
+        expectedOpening = type(firstOpening) == "table" and tonumber(firstOpening.spellId) or nil
+    end
+    assertTrue(expectedOpening ~= nil,
+        "连招段：取到当前生效预设（" .. tostring(activePresetKey) .. "）的首个开场技能 ID")
+    if #comboBoss.casts == 1 and expectedOpening ~= nil then
+        assertEq(comboBoss.casts[1].spellId, expectedOpening,
+            "连招段：开场技能 = 当前预设 openingSkills[1]（确定性随机取第一项）")
+    end
+
+    -- 第 2 次 AI 循环：走连招
+    comboBoss.casts, comboBoss.yells = {}, {}
+    local secondOk, secondErr = pcall(aiCallback, 0, 2500, 0, comboBoss)
+    assertTrue(secondOk, "连招段：第 2 次 AI 循环执行成功"
+        .. (secondOk and "" or ("（" .. tostring(secondErr) .. "）")))
+
+    local chains = scaledComboChains()
+    assertTrue(type(chains) == "table" and #chains > 0,
+        "连招段：现取到缩放后的 COMBO_CHAINS（" .. tostring(type(chains) == "table" and #chains or 0) .. " 条）")
+
+    local casts = comboBoss.casts
+    local castText = {}
+    for _, cast in ipairs(casts) do
+        castText[#castText + 1] = string.format("%s→%s", tostring(cast.spellId), tostring(cast.target))
+    end
+
+    local function sameSequence(combo)
+        if type(combo) ~= "table" or type(combo.skills) ~= "table" or #combo.skills ~= #casts then
+            return false
+        end
+        for index, skillInfo in ipairs(combo.skills) do
+            if type(skillInfo) ~= "table" or tonumber(skillInfo[1]) ~= casts[index].spellId
+                or skillInfo[2] ~= casts[index].target then
+                return false
+            end
+        end
+        return true
+    end
+
+    local matchedCombos = {}
+    for _, combo in ipairs(chains or {}) do
+        if sameSequence(combo) then matchedCombos[#matchedCombos + 1] = combo end
+    end
+    assertTrue(#casts > 0 and #matchedCombos >= 1,
+        string.format("连招段：第 2 次 AI 循环的施放序列与某条声明的连招完全一致（实际 [%s]）",
+            table.concat(castText, ", ")))
+
+    local executedCombo = matchedCombos[1]
+    if executedCombo ~= nil then
+        local declaredPhase = false
+        for _, phase in ipairs(type(executedCombo.phase) == "table" and executedCombo.phase or {}) do
+            if tonumber(phase) == comboState.phase then declaredPhase = true end
+        end
+        assertTrue(declaredPhase,
+            string.format("连招段：被选中的连招 %s 声明包含当前阶段 %s（phase=%s）",
+                tostring(executedCombo.name), tostring(comboState.phase),
+                type(executedCombo.phase) == "table" and table.concat(executedCombo.phase, ",") or "nil"))
+
+        assertEq(type(comboState.comboCooldowns) == "table" and comboState.comboCooldowns[executedCombo.name] or nil,
+            executedCombo.cooldown,
+            "连招段：state.comboCooldowns[" .. tostring(executedCombo.name) .. "] = 该连招的 cooldown")
+        assertEq(comboState.comboCooldown, 5, "连招段：触发连招后全局连招冷却 state.comboCooldown=5")
+
+        assertTrue(#comboBoss.yells == 1, "连招段：连招触发时喊话一次（实际 " .. #comboBoss.yells .. " 次）")
+        local expectedYell = type(comboYellMap) == "table" and comboYellMap[executedCombo.name] or nil
+        assertTrue(type(expectedYell) == "string" and expectedYell ~= "",
+            "连招段：运行时 comboYells 覆盖被执行的连招名 " .. tostring(executedCombo.name))
+        if #comboBoss.yells == 1 then
+            assertEq(comboBoss.yells[1], expectedYell,
+                "连招段：连招喊话内容 = BOSS_CONFIG.combatTaunts.comboYells[连招名]")
+        end
+    end
+else
+    fail("连招段：AI 回调或 bossAIStates 未建立，连招施放路径没能被驱动")
+end
+
+-- 还原场地：桩函数与假对象都要撤掉，后面的多区绑定断言仍用原来的桩
+env.math = savedComboMath
+env.type = savedComboType
+env.PerformIngameSpawn = savedComboSpawn
+env.GetPlayerByGUID = savedComboGetPlayer
+assertTrue(env.math == savedComboMath and env.type == savedComboType
+    and env.PerformIngameSpawn == savedComboSpawn and env.GetPlayerByGUID == savedComboGetPlayer,
+    "连招段结束：env.math / env.type / PerformIngameSpawn / GetPlayerByGUID 全部还原")
 
 -- ------------------------------------------------- 多区绑定（本区库名 / state_key）
 

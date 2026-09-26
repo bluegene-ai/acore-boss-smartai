@@ -40,6 +40,8 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 | 配置 | 分组齐全（24 组，含 6 个奖池）且项数之和等于描述表总数；喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板/技能池随机/**6 个独立奖池**/定时启停**确实取自数据库**（桩数据用与默认值不同的值）；数据库快照缺列会直接判失败 |
 | 命令 | `help` / `config reload` / `config show [分组]` / `preset list` / `preset <key>` / `preset random on\|off` / `preset pool <key,key>\|all` / `difficulty <key>` / `rebase` / `kill` / `clear` / `schedule` / `spawn` / `spawn force` / 未知子命令 的标记与语义 |
 | 技能池随机 | 两个配置列（`skill_preset_random_enabled` / `skill_preset_pool_text`）进建表与引导写入；开启后连续 20 次生成**每次都落在池内**且会出现不同预设；关闭后固定用 GM 指定的那套；`preset random off` / `preset pool` 写回扩展表且 `.boss config show` 立即反映；`preset pool <非法 key>` 返回 `AGMP_ERROR` |
+| 技能池 / 连招内容 | 按**变量名**从已注册回调的闭包链取 `SKILL_PRESET_LIBRARY` / `SKILL_DIFFICULTY_LIBRARY` / `ApplySkillPreset` / `ApplySkillDifficulty`（`debug.getupvalue`，没有命令能打印它们），对**全部**预设断言：连招里每个法术 ID 都在同一预设的池内（核心不变量）、`phase` 非空且 ⊆`{1,2,3}` 并有法术落在其声明阶段的池里、1/2/3 三段都被覆盖、池与 `openingSkills` 条目自检（`spellId>0` / `target∈{victim,self}` / `name` 非空 / 法术在池内）、连招名跨预设全局唯一、每个预设至少 `MIN_COMBOS_PER_PRESET` 条（顶部常量，内容扩充只改这一处）；连招喊话对**文件内默认库**硬断言（另加载一份 `CharDBQuery→nil` 的副本：运行时那份被 `taunt_combo_yells_text` 整体替换，只输出 `[info]`）；4 档难度 × 全部预设走真实 `ApplySkillPreset` / `ApplySkillDifficulty` 后**现取**缩放表，断言冷却 ≥4 且落在 10..45、`triggerChance` 落在 10..80、`raw triggerChance + comboChanceOffset` 未被 `ClampNumber` 静默钳制，末尾复原预设与难度 |
+| 连招施放（离线驱动） | 另建一套假 Boss（`IsInCombat=true` / 90% 血 = 阶段 1）+ 假玩家（战士，未读条 / 满血）驱动 `OnBossEnterCombat` → `SmartBossAI` 两次：第 1 次只放开场技能并置 `openingDone`；第 2 次的**施放序列必须与某条声明的连招完全一致**，并核对 `state.comboCooldowns[连招名]=该连招 cooldown`、全局 `state.comboCooldown=5`、被选中的连招必须声明包含当前阶段、连招喊话只念一次且内容 = `BOSS_CONFIG.combatTaunts.comboYells[连招名]`；随机性用 `env.math` 固定成「概率判定必过 + `math.random(n)` 取第一项」，段末还原 `env.math` / `env.type` / `PerformIngameSpawn` / `GetPlayerByGUID` |
 | 定时启停 | 三个配置列（`activity_schedule_enabled` / `_windows` / `_clear_on_close`）进建表、引导写入与 runtime 写入；用**可控时钟**（改写 `GetGameTime`）驱动每秒 tick：星期掩码不匹配不生成、进入时段补生成 + `schedule_open`、同一段内不重复生成（30 秒重试）、离开时段写 `schedule_close`、时段外 `.boss spawn` 被拒而 `spawn force` 放行 |
 | 6 个独立奖池（配置） | 36 个奖池列（6 池 × 开关/概率/人数模式/人数/职业过滤/奖品）进建表与引导写入；模拟老库缺列时自动 `ALTER` 补列；旧奖励模型的 13 列必须被 `DROP COLUMN` 且主表建表语句里不再出现；`reward` 组只剩选人字段而 `class_reward_items_text` 保留；`.boss config show reward_pool_N` 显示的是数据库值 |
 | 6 个独立奖池（实发） | 桩环境里放**假 Boss + 假玩家（战士/法师）**，临时改写 `env.type` 让 `IsUnitValid` 认账，驱动「受伤事件累贡献 → 死亡结算」整条 `OnBossDied`：池 1（全员）把职业专属物品发给对应职业、池 3（指定 2 人）只发给战士、关闭的池 4/5 一件不发、池 6 独立生效；`containers.reward_pools_mask` 位图逐位核对（战士=池1+3+6、法师=池1+2），并断言跨职业/不可用物品一次都没发出去 |
@@ -74,6 +76,13 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
   快照缺少描述表里的任何一列都会直接判失败。
 - 奖池实发那一段会临时改动 ext 快照里的 6 个奖池与职业映射（再 `.boss config reload`），段末恢复桩函数；
   假对象是用「表 + 改写 `type()`」冒充 userdata 的，`AddItem` 的记录就是断言用的"玩家背包"。
+- 技能池 / 连招的「内容」与「连招施放」两组断言用 `debug.getupvalue` **按变量名**从已注册回调的闭包链上
+  取文件内 local（`SKILL_PRESET_LIBRARY` / `BOSS_CONFIG` / 缩放后的 `COMBO_CHAINS` / `bossAIStates`…，
+  没有任何 `.boss` 命令会打印它们；写死上值下标会在 boss.lua 改动后失效，所以一律按名字查）。
+  连招施放段还会临时改写 `env.math`（概率判定必过、`math.random(n)` 取第一项）并另建一套假 Boss，
+  段末连同 `env.type` / `PerformIngameSpawn` / `GetPlayerByGUID` 一起还原。
+- 连招喊话的**默认值**只能靠另加载一份 `CharDBQuery` 返回 `nil` 的 boss.lua 副本读（`withDefaultConfig`）：
+  运行时那份 `comboYells` 会被扩展表列 `taunt_combo_yells_text` 整体替换。
 - runtime / events / contributors 的 SELECT 返回「无行」，走内存默认分支。
 - 桩环境里没有 `GetCreatureByGUID`：一旦脚本再引用它，会立刻以运行期错误暴露出来。
 - 本脚本不写任何文件（会刻意避开 `lua_scripts/lua_logs/`），也不连数据库。
